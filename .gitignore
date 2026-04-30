@@ -1,0 +1,49 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# IDE / editors
+.idea/
+.vs/
+.vscode/
+*.swp
+*.swo
+
+# Office files (lock files + experiment-tracking spreadsheets stay local)
+~$*
+*.xlsx
+
+# Claude Code per-user settings (project-shared settings.json should be committed)
+.claude/settings.local.json
+
+# Local outputs (defensive — these typically live outside the repo)
+*.log
+diagnostics.jsonl
+
+# Model files / checkpoints / data (defensive)
+*.pt
+*.pth
+*.npy
+*.bin
+*.safetensors
+*.ckpt
+log/
+ckpt/
+checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
