@@ -759,7 +759,8 @@ class LayerDiagnostics:
 
     def log_diagnostics(self, step: int, log_dir: str, total_tokens: int = 0,
                          filename: str = "diagnostics.jsonl",
-                         awd_data: dict = None, moe_data: dict = None):
+                         awd_data: dict = None, moe_data: dict = None,
+                         activation_data: dict = None):
         """
         Compute diagnostics and write to JSONL file.
         Only rank 0 writes to the file.
@@ -769,7 +770,16 @@ class LayerDiagnostics:
             log_dir: Directory to write the log file
             total_tokens: Total tokens processed so far
             filename: Name of the JSONL file
-            awd_data: Optional AWD per-component state from AdaptiveWD.get_diagnostics_data()
+            awd_data: Optional AWD per-component state
+            moe_data: Optional MoE balance stats
+            activation_data: Optional forward-activation RMS profile produced by
+                ActivationProbe.detach_and_get(). Schema:
+                  {'layers_by_idx': {idx: {h_in_rms, attn_out_rms, h_mid_rms,
+                                            ffn_out_rms, h_out_rms}},
+                   'final_norm_in_rms': float,
+                   'final_norm_out_rms': float}
+                Per-layer entries are folded into each layer record under 'act';
+                top-level entries become top-level fields.
         """
         snapshot = self.compute_diagnostics(step, total_tokens)
 
@@ -805,6 +815,18 @@ class LayerDiagnostics:
                         for lid, pct, cv, bias in moe_data['per_layer']
                     ]
                 }
+
+            # Merge forward-activation RMS profile when provided.
+            if activation_data is not None:
+                layers_by_idx = activation_data.get('layers_by_idx') or {}
+                for layer_dict in data['layers']:
+                    act = layers_by_idx.get(layer_dict['idx'])
+                    if act:
+                        layer_dict['act'] = act
+                if 'final_norm_in_rms' in activation_data:
+                    data['final_norm_in_rms'] = activation_data['final_norm_in_rms']
+                if 'final_norm_out_rms' in activation_data:
+                    data['final_norm_out_rms'] = activation_data['final_norm_out_rms']
 
             # Append to JSONL file
             filepath = os.path.join(log_dir, filename)

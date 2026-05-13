@@ -24,7 +24,7 @@ import os
 import math
 import inspect
 from typing import List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -106,7 +106,46 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         if self._use_native:
             return F.rms_norm(x.float(), self.weight.shape, self.weight.float(), self.eps).type_as(x)
-        return self._norm(x.float()).type_as(x) * self.weight 
+        return self._norm(x.float()).type_as(x) * self.weight
+
+
+class AuxHead(nn.Module):
+    """
+    Auxiliary next-token prediction head for intermediate-depth supervision.
+
+    RMSNorm + Linear -> CE against the same shifted targets as the main LM head.
+    Used to distribute readout-shaping pressure across the body so no single
+    late block has to do all the abstract -> token-space translation.
+
+    No weight sharing with the main LM head — each aux head learns its own readout.
+
+    Forward is the loss path (not logits): with FSDP2 we want params to be
+    unsharded on __call__ entry and resharded on exit, so the loss kernel has
+    to live inside forward(). The whole module is wrapped with fully_shard().
+    """
+    def __init__(self, dim: int, vocab_size: int, norm_eps: float):
+        super().__init__()
+        self.norm = RMSNorm(dim, eps=norm_eps)
+        self.linear = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, h_tap, tgt_flat, pad_id):
+        """Compute CE loss at this tap point via fused CCE kernel."""
+        h_norm = self.norm(h_tap)
+        h_flat = h_norm.reshape(-1, h_norm.size(-1))
+        out_dtype = self.linear.weight.dtype
+        if h_flat.dtype != out_dtype:
+            h_flat = h_flat.to(out_dtype)
+        accum_fp32 = out_dtype == torch.float32
+        return cce_loss(
+            h_flat,
+            self.linear.weight,
+            tgt_flat,
+            accum_e_fp32=accum_fp32,
+            accum_c_fp32=accum_fp32,
+            reduction="mean",
+            ignore_index=pad_id,
+        )
+
 
 @dataclass
 class ModelArgs:
@@ -163,6 +202,12 @@ class ModelArgs:
     # Paper: "Attention Residuals" — Kimi Team (2026)
     attn_res_enabled: bool = False         # enable Block AttnRes
     attn_res_block_size: int = 8           # layers per block (n_layers should be divisible by this)
+    # Auxiliary prediction heads — RMSNorm + Linear at intermediate depths.
+    # Distributes readout-shaping pressure across the body. List of 0-indexed
+    # layer positions; head taps the output of layers[i] (i.e. the value that
+    # becomes layers[i+1]'s input). Per-head loss weights are applied by the
+    # trainer, not the model.
+    aux_head_layers: List[int] = field(default_factory=list)
 
 def _block_attn_res_fn(partial_block, qk, eps, *blocks):
     """AttnRes core — all intermediates recomputed during backward via checkpoint.
@@ -1257,6 +1302,24 @@ class Transformer(nn.Module):
                 RMSNorm(params.dim, eps=params.norm_eps) for _ in range(params.n_layers)
             ])
 
+        # Auxiliary prediction heads at configured intermediate depths.
+        # Each tap reads block-output activations during forward and produces
+        # its own next-token loss against shifted targets. Per-head weighting
+        # is applied by the trainer, not the model.
+        self.aux_head_layers: List[int] = sorted(set(getattr(params, 'aux_head_layers', []) or []))
+        for _li in self.aux_head_layers:
+            if _li < 0 or _li >= params.n_layers:
+                raise ValueError(
+                    f"aux_head_layers entry {_li} is out of range for n_layers={params.n_layers}"
+                )
+        self.aux_heads = nn.ModuleDict({
+            str(li): AuxHead(params.dim, params.vocab_size, params.norm_eps)
+            for li in self.aux_head_layers
+        })
+        # Set-form for O(1) membership tests inside the forward loop
+        self._aux_head_layer_set: set = set(self.aux_head_layers)
+        self._last_aux_loss_tensors: dict = {}
+
         # Optional weight tying
         self.tie_word_embeddings = getattr(params, "tie_word_embeddings", True)
         if self.tie_word_embeddings:
@@ -1441,6 +1504,14 @@ class Transformer(nn.Module):
 
         n_active = active_layers if (active_layers is not None and active_layers < len(self.layers)) else len(self.layers)
 
+        # Aux head taps captured during the block loop (training only).
+        # Keyed by layer index; value is the block's output activation (the
+        # tensor that becomes the next block's input under the default path).
+        # Skipped during eval/val (self.training is False) — val loss reflects
+        # only the main task.
+        aux_taps: dict = {}
+        capture_aux = bool(self._aux_head_layer_set) and (targets is not None) and self.training
+
         if self.attn_res_enabled:
             # AttnRes: selective depth-wise retrieval via learned block attention
             blocks = [h]                           # b_0 = token embedding
@@ -1461,6 +1532,8 @@ class Transformer(nn.Module):
                     blocks.append(partial_block)
                     partial_block = torch.zeros_like(h)
                 h = h_out
+                if capture_aux and i in self._aux_head_layer_set:
+                    aux_taps[i] = h
 
         elif n_active < len(self.layers):
             # Truncated path — skip tail layers (progressive tail truncation)
@@ -1468,6 +1541,14 @@ class Transformer(nn.Module):
                 if i >= n_active:
                     break
                 h = blk(h, freqs_cos, freqs_sin)
+                if capture_aux and i in self._aux_head_layer_set:
+                    aux_taps[i] = h
+        elif capture_aux:
+            # Full-depth path with aux heads enabled: enumerate to capture taps.
+            for i, blk in enumerate(self.layers):
+                h = blk(h, freqs_cos, freqs_sin)
+                if i in self._aux_head_layer_set:
+                    aux_taps[i] = h
         else:
             # Full-depth path — identical to original for torch.compile fast path
             for blk in self.layers:
@@ -1506,6 +1587,21 @@ class Transformer(nn.Module):
                     if al is not None:
                         loss = loss + al
                         blk.moe._last_aux_loss = None
+
+            # Auxiliary prediction-head losses at captured tap points. The
+            # trainer reads these tensors from self._last_aux_loss_tensors,
+            # applies the per-head schedule weight at the current step, and
+            # sums them into the main loss before calling .backward(). Keeping
+            # the weighting in the trainer means the schedule lives in config,
+            # not in the model.
+            new_aux_losses: dict = {}
+            if aux_taps:
+                for li, h_tap in aux_taps.items():
+                    # Call through __call__ so FSDP unshard/reshard hooks fire.
+                    new_aux_losses[li] = self.aux_heads[str(li)](
+                        h_tap, tgt_flat, pad_id
+                    )
+            self._last_aux_loss_tensors = new_aux_losses
 
             self.last_loss = loss
             return None, loss
