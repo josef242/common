@@ -168,7 +168,7 @@ def create_balanced_device_map(model, n_gpus: int):
 def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool, qk_norm_mode=None, use_keel=None):
     """Internal helper: construct ``Transformer`` instance and load weights."""
 
-    chk = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    chk = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
 
     # Detect checkpoint version and import appropriate model
     checkpoint_version = chk.get("checkpoint_version", "2.0")  # Default to 2.0 for old checkpoints
@@ -373,7 +373,7 @@ def load_model_and_tokenizer(
         raise ValueError("Legacy .bin checkpoints not supported – use .pt")
 
     # Load checkpoint metadata and log it
-    chk_meta = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    chk_meta = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
 
     # Log all checkpoint metadata
     logger.print_and_log("Checkpoint metadata:")
