@@ -63,6 +63,65 @@ def cce_loss(hidden, weight, targets, **kwargs):
     return linear_cross_entropy(hidden, weight, targets, **kwargs)
 
 
+def _bagged_lm_loss(h_flat, weight, targets, bag_size, pad_id,
+                    accum_e_fp32=False, accum_c_fp32=False, power_law=False):
+    """
+    Cross-entropy LM loss that supports Token Superposition Training (TST) bagging.
+
+    bag_size == 1:  exactly one fused CCE call against `targets.reshape(-1)` —
+                    zero-overhead path identical to vanilla NTP.
+    bag_size  > 1:  bag the labels (shift left by s-1, pad with `pad_id`,
+                    reshape to (B, L, s)), call CCE once per bag position, and
+                    return the (optionally power-law) weighted average. Used by
+                    both the main LM head and AuxHead under TST so the entire
+                    LM-head family stays consistent.
+
+    Args:
+        h_flat:    (B*L, D) hidden states aligned with the L bagged positions
+        weight:    (V, D) LM head projection weight
+        targets:   (B, L*s) un-bagged labels (or (B, L) when bag_size == 1)
+        bag_size:  s (>= 1)
+        pad_id:    ignore_index for CE; also used as the shift padding value
+        power_law: if True, weight bag position i as w_i = 1/(i+1)
+                   (paper recommends for s >= 8; uniform is fine for s <= 6)
+
+    Returns: scalar loss tensor.
+    """
+    if bag_size == 1:
+        tgt_flat = targets.reshape(-1)
+        return cce_loss(
+            h_flat, weight, tgt_flat,
+            accum_e_fp32=accum_e_fp32, accum_c_fp32=accum_c_fp32,
+            reduction="mean", ignore_index=pad_id,
+        )
+
+    bs, total = targets.shape
+    seq = total // bag_size
+    assert seq * bag_size == total, (
+        f"_bagged_lm_loss: targets length {total} not divisible by bag_size {bag_size}"
+    )
+
+    # Causal shift: bag at position t predicts tokens [t+s, t+2s-1] in raw stream.
+    # Pad with pad_id so the trailing bag positions are masked by ignore_index.
+    offset = bag_size - 1
+    shifted = F.pad(targets, (0, offset), value=pad_id)[..., offset:]
+    bagged = shifted.view(bs, seq, bag_size)
+
+    loss = None
+    w_total = 0.0
+    for i in range(bag_size):
+        w = (1.0 / (i + 1)) if power_law else 1.0
+        target_i = bagged[..., i].reshape(-1)
+        ce_i = cce_loss(
+            h_flat, weight, target_i,
+            accum_e_fp32=accum_e_fp32, accum_c_fp32=accum_c_fp32,
+            reduction="mean", ignore_index=pad_id,
+        )
+        loss = ce_i * w if loss is None else loss + ce_i * w
+        w_total += w
+    return loss / w_total
+
+
 # ----------------------------------------------------------------------------
 # Flash Attention (optional)
 # ----------------------------------------------------------------------------
@@ -128,22 +187,31 @@ class AuxHead(nn.Module):
         self.norm = RMSNorm(dim, eps=norm_eps)
         self.linear = nn.Linear(dim, vocab_size, bias=False)
 
-    def forward(self, h_tap, tgt_flat, pad_id):
-        """Compute CE loss at this tap point via fused CCE kernel."""
+    def forward(self, h_tap, targets, pad_id, bag_size=1, power_law=False):
+        """
+        Compute CE loss at this tap point.
+
+        Args:
+            h_tap:    (B, L, D) tapped activation from the body
+            targets:  (B, L*bag_size) un-bagged labels when TST is on,
+                      otherwise the same flat-or-2D targets the main head sees
+            pad_id:   ignore_index
+            bag_size: s for TST; 1 disables bagging (vanilla NTP path)
+            power_law: per-bag-position weighting flag
+
+        Routes through the shared `_bagged_lm_loss` helper so the aux head
+        and the main head stay in lockstep on TST behavior.
+        """
         h_norm = self.norm(h_tap)
         h_flat = h_norm.reshape(-1, h_norm.size(-1))
         out_dtype = self.linear.weight.dtype
         if h_flat.dtype != out_dtype:
             h_flat = h_flat.to(out_dtype)
         accum_fp32 = out_dtype == torch.float32
-        return cce_loss(
-            h_flat,
-            self.linear.weight,
-            tgt_flat,
-            accum_e_fp32=accum_fp32,
-            accum_c_fp32=accum_fp32,
-            reduction="mean",
-            ignore_index=pad_id,
+        return _bagged_lm_loss(
+            h_flat, self.linear.weight, targets, bag_size, pad_id,
+            accum_e_fp32=accum_fp32, accum_c_fp32=accum_fp32,
+            power_law=power_law,
         )
 
 
@@ -1469,6 +1537,8 @@ class Transformer(nn.Module):
         targets: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = None,
         active_layers: Optional[int] = None,
+        tst_bag_size: int = 1,
+        tst_power_law: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Unified forward - handles training, eval, and KV-cached inference.
@@ -1477,11 +1547,20 @@ class Transformer(nn.Module):
         FSDP2, as it bypasses the module call hooks that FSDP2 relies on.
 
         Args:
-            tokens: Input token IDs [B, S]
-            targets: Target token IDs for training [B, S], or None for inference
-            start_pos: Starting position for KV-cached inference, or None for training/eval
-            active_layers: If set, only run the first N layers (progressive tail truncation).
-                           The final norm + output head are always applied regardless.
+            tokens: Input token IDs.
+                Standard NTP / phase 2: [B, S]
+                Token Superposition Training (TST) phase 1: [B, S, s] where each
+                position holds a bag of `s` raw tokens; embeddings are averaged
+                inside this method to produce the (B, S, D) hidden the trunk sees.
+            targets: Target token IDs for training; None for inference.
+                Standard / phase 2: [B, S] (one target per position)
+                TST phase 1: [B, S*s] (un-bagged raw labels; bagged inside the
+                loss helper)
+            start_pos: Starting position for KV-cached inference, or None.
+            active_layers: If set, only run the first N layers (progressive tail
+                truncation). The final norm + output head are always applied.
+            tst_bag_size: TST bag size `s`. 1 = vanilla NTP (zero-overhead path).
+            tst_power_law: When bagging, weight bag positions as 1/(i+1).
 
         Returns:
             (logits, loss) where:
@@ -1494,9 +1573,17 @@ class Transformer(nn.Module):
             logits = self.generate_forward(tokens, start_pos)
             return logits, None
 
-        # Standard training/eval path
-        B, S = tokens.shape
-        h = self.tok_embeddings(tokens)
+        # Standard training/eval path. Under TST phase 1 the loader hands us
+        # tokens of shape (B, S, s); average the bag of embeddings into a single
+        # (B, S, D) hidden so the trunk sees the same shape it always does.
+        if tokens.dim() == 3:
+            B, S, _bag = tokens.shape
+            # Sum in fp32 for precision then cast back, per the paper.
+            emb_dtype = self.tok_embeddings.weight.dtype
+            h = self.tok_embeddings(tokens).float().mean(dim=2).to(emb_dtype)
+        else:
+            B, S = tokens.shape
+            h = self.tok_embeddings(tokens)
         h = self.dropout(h)
 
         freqs_cos = self.freqs_cos[:S]
@@ -1560,9 +1647,8 @@ class Transformer(nn.Module):
         if targets is not None:
             pad_id = self.params.pad_id
 
-            # Flatten without materializing a masked copy of h
+            # Flatten hidden without materializing a masked copy.
             h_flat = h.reshape(-1, h.size(-1))
-            tgt_flat = targets.reshape(-1)
 
             # Ensure hidden states match output weight dtype (CCE Triton kernel requires same dtype)
             out_dtype = self.output.weight.dtype
@@ -1570,14 +1656,12 @@ class Transformer(nn.Module):
                 h_flat = h_flat.to(out_dtype)
 
             accum_fp32 = out_dtype == torch.float32
-            loss = cce_loss(
-                h_flat,
-                self.output.weight,
-                tgt_flat,
-                accum_e_fp32=accum_fp32,
-                accum_c_fp32=accum_fp32,
-                reduction="mean",
-                ignore_index=pad_id,
+            # Main LM loss. Single fused CCE under vanilla NTP; bagged loop
+            # under TST. Helper handles both paths.
+            loss = _bagged_lm_loss(
+                h_flat, self.output.weight, targets, tst_bag_size, pad_id,
+                accum_e_fp32=accum_fp32, accum_c_fp32=accum_fp32,
+                power_law=tst_power_law,
             )
 
             # Collect aux balance losses from MoE layers
@@ -1594,12 +1678,16 @@ class Transformer(nn.Module):
             # sums them into the main loss before calling .backward(). Keeping
             # the weighting in the trainer means the schedule lives in config,
             # not in the model.
+            #
+            # Aux heads share the LM-loss helper so TST bagging applies to them
+            # automatically — they predict the same bag the main head predicts.
             new_aux_losses: dict = {}
             if aux_taps:
                 for li, h_tap in aux_taps.items():
                     # Call through __call__ so FSDP unshard/reshard hooks fire.
                     new_aux_losses[li] = self.aux_heads[str(li)](
-                        h_tap, tgt_flat, pad_id
+                        h_tap, targets, pad_id,
+                        bag_size=tst_bag_size, power_law=tst_power_law,
                     )
             self._last_aux_loss_tensors = new_aux_losses
 
