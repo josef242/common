@@ -1612,12 +1612,17 @@ class Transformer(nn.Module):
                     ignore_index=pad_id,
                 )
 
-            # MoE balance losses: only valid when the main loss path ran (an
-            # MoE layer's aux balance is undefined without that layer firing,
-            # which under scaffold_mode only happens for the active range —
-            # the surviving MoE balance terms are still in blk.moe._last_aux_loss
-            # and we fold them in for scaffold mode too if any are present).
-            for blk in self.layers:
+            # MoE balance losses: fold in from layers that actually ran this
+            # forward. Crucially we scope the loop to the active range —
+            # under scaffold the tail MoE layers didn't fire, so their
+            # `_last_aux_loss` would be either None or a stale tensor from a
+            # prior full-depth forward (e.g. baseline val). Adding the stale
+            # tensor would attempt to backward through a graph that's
+            # already been consumed → RuntimeError. Bound by n_active to
+            # match the forward loop.
+            for i, blk in enumerate(self.layers):
+                if i >= n_active:
+                    break
                 if getattr(blk, 'moe_enabled', False):
                     al = blk.moe._last_aux_loss
                     if al is not None:
@@ -1636,9 +1641,10 @@ class Transformer(nn.Module):
             new_aux_losses: dict = {}
             if aux_taps:
                 for li, h_tap in aux_taps.items():
-                    # Call through __call__ so FSDP unshard/reshard hooks fire.
-                    # AuxHead.forward bags labels internally so it can take the
-                    # un-flattened (B, S) targets directly.
+                    # Call through __call__ so FSDP unshard/reshard hooks
+                    # fire. AuxHead.forward signature is
+                    # (h_tap, tgt_flat, pad_id) — it does its own RMSNorm +
+                    # CCE on the flattened (B*S,) target tensor.
                     new_aux_losses[li] = self.aux_heads[str(li)](
                         h_tap, targets.reshape(-1), pad_id
                     )
