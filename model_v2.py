@@ -1469,6 +1469,7 @@ class Transformer(nn.Module):
         targets: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = None,
         active_layers: Optional[int] = None,
+        scaffold_mode: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Unified forward - handles training, eval, and KV-cached inference.
@@ -1481,11 +1482,24 @@ class Transformer(nn.Module):
             targets: Target token IDs for training [B, S], or None for inference
             start_pos: Starting position for KV-cached inference, or None for training/eval
             active_layers: If set, only run the first N layers (progressive tail truncation).
-                           The final norm + output head are always applied regardless.
+                           In scaffold_mode this is the truncation depth for both
+                           forward and backward; otherwise the final norm + output
+                           head still fire on the layer-N output.
+            scaffold_mode: Scaffolded Cascading Supervision (SCS) phase. When True,
+                           the main LM head (self.norm + self.output + main-loss CCE)
+                           is skipped entirely — the loss is the sum of weighted aux
+                           head losses captured during the truncated block loop. The
+                           deepest active aux head is doing the LM prediction. Caller
+                           must pass active_layers = deepest_active_aux_tap + 1 to
+                           ensure that aux head's tap fires.
 
         Returns:
             (logits, loss) where:
-            - Training (targets given): (None, loss)
+            - Training (targets given, scaffold_mode=False): (None, main_loss); aux
+              losses are stashed in self._last_aux_loss_tensors as usual.
+            - Training (targets given, scaffold_mode=True): (None, None); aux losses
+              are stashed in self._last_aux_loss_tensors and the trainer aggregates
+              them into the total objective (no main loss to combine with).
             - Inference (no targets): (logits, None)
             - KV-cached (start_pos given): (logits, None)
         """
@@ -1510,7 +1524,9 @@ class Transformer(nn.Module):
         # Skipped during eval/val (self.training is False) — val loss reflects
         # only the main task.
         aux_taps: dict = {}
-        capture_aux = bool(self._aux_head_layer_set) and (targets is not None) and self.training
+        # Capture aux taps during training, or during eval-time scaffold (val
+        # needs the deepest active aux head's CE as its effective loss).
+        capture_aux = bool(self._aux_head_layer_set) and (targets is not None) and (self.training or scaffold_mode)
 
         if self.attn_res_enabled:
             # AttnRes: selective depth-wise retrieval via learned block attention
@@ -1554,38 +1570,54 @@ class Transformer(nn.Module):
             for blk in self.layers:
                 h = blk(h, freqs_cos, freqs_sin)
 
-        h = self.norm(h)
+        # In scaffold_mode the main LM head is intentionally skipped — the
+        # partial network's "LM head" is the deepest active aux head, and
+        # running self.norm + self.output would (a) waste compute, (b) touch
+        # uninitialised tail params via the all-gather, and (c) produce a
+        # garbage loss against untrained weights. The aux taps captured above
+        # carry the supervision.
+        if not scaffold_mode:
+            h = self.norm(h)
 
         # ── TRAINING BRANCH ────────────────────────────────────────
         if targets is not None:
             pad_id = self.params.pad_id
 
-            # Flatten without materializing a masked copy of h
-            h_flat = h.reshape(-1, h.size(-1))
-            tgt_flat = targets.reshape(-1)
+            if scaffold_mode:
+                # No main loss to compute. Aux losses below are still computed
+                # from the captured taps and stashed for the trainer.
+                loss = None
+            else:
+                # Flatten without materializing a masked copy of h
+                h_flat = h.reshape(-1, h.size(-1))
+                tgt_flat = targets.reshape(-1)
 
-            # Ensure hidden states match output weight dtype (CCE Triton kernel requires same dtype)
-            out_dtype = self.output.weight.dtype
-            if h_flat.dtype != out_dtype:
-                h_flat = h_flat.to(out_dtype)
+                # Ensure hidden states match output weight dtype (CCE Triton kernel requires same dtype)
+                out_dtype = self.output.weight.dtype
+                if h_flat.dtype != out_dtype:
+                    h_flat = h_flat.to(out_dtype)
 
-            accum_fp32 = out_dtype == torch.float32
-            loss = cce_loss(
-                h_flat,
-                self.output.weight,
-                tgt_flat,
-                accum_e_fp32=accum_fp32,
-                accum_c_fp32=accum_fp32,
-                reduction="mean",
-                ignore_index=pad_id,
-            )
+                accum_fp32 = out_dtype == torch.float32
+                loss = cce_loss(
+                    h_flat,
+                    self.output.weight,
+                    tgt_flat,
+                    accum_e_fp32=accum_fp32,
+                    accum_c_fp32=accum_fp32,
+                    reduction="mean",
+                    ignore_index=pad_id,
+                )
 
-            # Collect aux balance losses from MoE layers
+            # MoE balance losses: only valid when the main loss path ran (an
+            # MoE layer's aux balance is undefined without that layer firing,
+            # which under scaffold_mode only happens for the active range —
+            # the surviving MoE balance terms are still in blk.moe._last_aux_loss
+            # and we fold them in for scaffold mode too if any are present).
             for blk in self.layers:
                 if getattr(blk, 'moe_enabled', False):
                     al = blk.moe._last_aux_loss
                     if al is not None:
-                        loss = loss + al
+                        loss = al if loss is None else loss + al
                         blk.moe._last_aux_loss = None
 
             # Auxiliary prediction-head losses at captured tap points. The
@@ -1594,12 +1626,17 @@ class Transformer(nn.Module):
             # sums them into the main loss before calling .backward(). Keeping
             # the weighting in the trainer means the schedule lives in config,
             # not in the model.
+            #
+            # In scaffold_mode there's no main loss to combine with — the
+            # trainer treats the aux head sum as the total objective directly.
             new_aux_losses: dict = {}
             if aux_taps:
                 for li, h_tap in aux_taps.items():
                     # Call through __call__ so FSDP unshard/reshard hooks fire.
+                    # AuxHead.forward bags labels internally so it can take the
+                    # un-flattened (B, S) targets directly.
                     new_aux_losses[li] = self.aux_heads[str(li)](
-                        h_tap, tgt_flat, pad_id
+                        h_tap, targets.reshape(-1), pad_id
                     )
             self._last_aux_loss_tensors = new_aux_losses
 
