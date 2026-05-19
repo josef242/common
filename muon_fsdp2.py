@@ -373,7 +373,13 @@ class Fsdp1dWork:
             lr_scale = self.lr_scale_overrides.get(id(self.param), 1.0)
             self.param.add_(update.reshape(self.param.shape), alpha=-self.group["lr"] * R * lr_scale)
         else:
-            # Standard path: apply weight decay then update
+            # Standard path: apply weight decay then update.
+            # effective_lr = lr * lr_scale; WD scales with it so setting
+            # lr_scale_overrides[id(p)] = 0 freezes the param entirely
+            # (no update AND no WD-driven decay). This invariant is relied
+            # on by SCS / lr_mods / output_lr_batch_adjust.
+            lr_scale = self.lr_scale_overrides.get(id(self.param), 1.0)
+            effective_lr = self.group["lr"] * lr_scale
             wd = self.wd_overrides.get(id(self.param), self.group["weight_decay"])
             if wd != 0:
                 if self.group.get("cautious_weight_decay", False):
@@ -382,15 +388,14 @@ class Fsdp1dWork:
                     apply_cautious_weight_decay(
                         self.param,
                         self.state["momentum_buffer"],
-                        self.group["lr"],
+                        effective_lr,
                         wd
                     )
                 else:
                     # Standard weight decay
-                    self.param.mul_(1 - self.group["lr"] * wd)
+                    self.param.mul_(1 - effective_lr * wd)
 
-            lr_scale = self.lr_scale_overrides.get(id(self.param), 1.0)
-            self.param.add_(update.reshape(self.param.shape), alpha=-self.group["lr"] * lr_scale)
+            self.param.add_(update.reshape(self.param.shape), alpha=-effective_lr)
 
 
 class TpFsdp2dWork:
@@ -434,8 +439,11 @@ class SingelDeviceWork:
         update = muon_update(self.param.grad, self.state["momentum_buffer"], self.group["momentum"], self.group["nesterov"], self.group["ns_steps"], self.group["rms_scale"])
 
         # =============================================================
-        # Weight Decay (standard or cautious)
+        # Weight Decay (standard or cautious) — scaled by lr_scale so a
+        # zeroed-out lr_scale freezes the param entirely (no WD decay).
         # =============================================================
+        lr_scale = self.lr_scale_overrides.get(id(self.param), 1.0)
+        effective_lr = self.group["lr"] * lr_scale
         wd = self.wd_overrides.get(id(self.param), self.group["weight_decay"])
         if wd != 0:
             if self.group.get("cautious_weight_decay", False):
@@ -443,15 +451,14 @@ class SingelDeviceWork:
                 apply_cautious_weight_decay(
                     self.param,
                     self.state["momentum_buffer"],
-                    self.group["lr"],
+                    effective_lr,
                     wd
                 )
             else:
                 # Standard weight decay
-                self.param.mul_(1 - self.group["lr"] * wd)
+                self.param.mul_(1 - effective_lr * wd)
 
-        lr_scale = self.lr_scale_overrides.get(id(self.param), 1.0)
-        self.param.add_(update.reshape(self.param.shape), alpha=-self.group["lr"] * lr_scale)
+        self.param.add_(update.reshape(self.param.shape), alpha=-effective_lr)
 
     def finish(self):
         pass
@@ -647,21 +654,24 @@ class Muon(torch.optim.Optimizer):
                         update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                              state["step"], group["betas"], group["eps"])
 
-                        # Weight Decay (standard or cautious)
+                        # Weight Decay scaled by lr_scale so a zeroed-out
+                        # lr_scale (SCS freeze, lr_mods, etc.) freezes the
+                        # param entirely with no silent WD-driven decay.
+                        lr_scale = self.lr_scale_overrides.get(id(p), 1.0)
+                        effective_lr = group["lr"] * lr_scale
                         wd = self.wd_overrides.get(id(p), group["weight_decay"])
                         if wd != 0:
                             if group.get("cautious_weight_decay", False):
                                 apply_cautious_weight_decay(
                                     p,
                                     state["exp_avg"],
-                                    group["lr"],
+                                    effective_lr,
                                     wd
                                 )
                             else:
-                                p.mul_(1 - group["lr"] * wd)
+                                p.mul_(1 - effective_lr * wd)
 
-                        lr_scale = self.lr_scale_overrides.get(id(p), 1.0)
-                        p.add_(update, alpha=-group["lr"] * lr_scale)
+                        p.add_(update, alpha=-effective_lr)
 
         for work in dq:
             work.finish()
