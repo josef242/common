@@ -584,6 +584,14 @@ class Muon(torch.optim.Optimizer):
 
             if group["use_muon"]:
                 for i, p in enumerate(group["params"]):
+                    # Frozen via lr_scale=0 (SCS scaffold, lr_mods, etc.):
+                    # skip the entire pipeline — no all_gather, no NS, no
+                    # momentum/second-moment buffer update, no WD. Saves a
+                    # significant chunk of optimizer cost during long
+                    # partial-depth phases and prevents spurious decay of
+                    # momentum buffers across them.
+                    if self.lr_scale_overrides.get(id(p), 1.0) == 0.0:
+                        continue
                     if p.grad is None:
                         p.grad = torch.zeros_like(p)  # Force synchronization
                     state = self.state[p]
@@ -602,6 +610,12 @@ class Muon(torch.optim.Optimizer):
                         dq.popleft().finish()
             else:
                 for p in group["params"]:
+                    # Same freeze short-circuit for the Adam path. With
+                    # effective_lr = lr * lr_scale = 0, both update and WD
+                    # would be no-ops; skipping avoids the exp_avg /
+                    # exp_avg_sq state updates as well.
+                    if self.lr_scale_overrides.get(id(p), 1.0) == 0.0:
+                        continue
                     if p.grad is None:
                         p.grad = torch.zeros_like(p)  # Force synchronization
                     state = self.state[p]

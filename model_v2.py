@@ -1495,11 +1495,15 @@ class Transformer(nn.Module):
 
         Returns:
             (logits, loss) where:
-            - Training (targets given, scaffold_mode=False): (None, main_loss); aux
-              losses are stashed in self._last_aux_loss_tensors as usual.
-            - Training (targets given, scaffold_mode=True): (None, None); aux losses
-              are stashed in self._last_aux_loss_tensors and the trainer aggregates
-              them into the total objective (no main loss to combine with).
+            - Training (targets given, scaffold_mode=False): (None, main_loss);
+              aux losses are stashed in self._last_aux_loss_tensors as usual.
+            - Training (targets given, scaffold_mode=True): (None, loss_or_None).
+              The main LM head is skipped, so the only contribution to the
+              returned loss is any MoE balance-loss sum from MoE layers in the
+              active range; loss is None when there's no MoE in the active
+              range (the common dense case). Aux losses are still stashed in
+              self._last_aux_loss_tensors and the trainer aggregates them into
+              the total objective.
             - Inference (no targets): (logits, None)
             - KV-cached (start_pos given): (logits, None)
         """
