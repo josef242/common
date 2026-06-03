@@ -548,17 +548,36 @@ class Attention(nn.Module):
         k = keys.transpose(1, 2)      # [B, Hkv, S_kv, D]
         v = values.transpose(1, 2)        
 
-        # For single-token decode, we attend to all past tokens (no causal mask needed)
-        # For prefill (seqlen > 1), we need causal masking within the new tokens
-        is_causal = (seqlen > 1)
-        
+        # For single-token decode (seqlen == 1) we attend to all past keys, no mask.
+        # For prefill (seqlen > 1) we need a causal mask.
+        #
+        # IMPORTANT: query positions are [start_pos, start_pos+seqlen) but key
+        # positions are [0, start_pos+seqlen) — a NON-SQUARE score matrix when
+        # start_pos > 0 (cross-turn prefix reuse prefills only the suffix). SDPA's
+        # is_causal=True applies a TOP-LEFT-aligned square mask, which is only
+        # correct when start_pos == 0. For start_pos > 0 it would let suffix query
+        # i attend to keys [0, i] instead of the correct [0, start_pos+i] — silent
+        # wrong output. So: use is_causal=True ONLY for the start_pos == 0 prefill,
+        # and build an explicit absolute-position-aligned mask otherwise.
+        need_mask = (seqlen > 1)
+        use_is_causal = need_mask and (start_pos == 0)
+        attn_mask = None
+        if need_mask and not use_is_causal:
+            # Bottom-right / absolute-aligned causal mask: query row r (absolute
+            # position start_pos+r) may attend to key cols <= start_pos+r.
+            total_len = start_pos + seqlen
+            attn_mask = torch.triu(
+                torch.full((seqlen, total_len), float("-inf"), device=x.device, dtype=xq.dtype),
+                diagonal=start_pos + 1,
+            )
+
         if self.use_sdp:
             if self.n_rep > 1 and self.sdp_enable_gqa:
                 out = F.scaled_dot_product_attention(
                     xq, k, v,
-                    attn_mask=None,
+                    attn_mask=attn_mask,
                     dropout_p=0.0,
-                    is_causal=is_causal,
+                    is_causal=use_is_causal,
                     enable_gqa=True,
                 )
             else:
@@ -568,26 +587,29 @@ class Attention(nn.Module):
                     v = repeat_kv(values, self.n_rep).transpose(1, 2)
                 out = F.scaled_dot_product_attention(
                     xq, k, v,
-                    attn_mask=None,
+                    attn_mask=attn_mask,
                     dropout_p=0.0,
-                    is_causal=is_causal
-                )            
+                    is_causal=use_is_causal
+                )
         else:
             # Manual attention path requires matched head counts
             k = repeat_kv(keys, self.n_rep).transpose(1, 2)
             v = repeat_kv(values, self.n_rep).transpose(1, 2)
 
-            scores = torch.matmul(xq, k.transpose(2, 3)) / math.sqrt(self.head_dim)            
-            if is_causal:
-                # Build causal mask for prefill
-                # Query positions: [start_pos, start_pos+seqlen)
-                # Key positions: [0, start_pos+seqlen)
-                total_len = start_pos + seqlen
-                mask = torch.triu(
-                    torch.full((seqlen, total_len), float("-inf"), device=x.device),
-                    diagonal=start_pos + 1
-                )
-                scores = scores + mask
+            scores = torch.matmul(xq, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if need_mask:
+                # Absolute-aligned causal mask covering both start_pos==0 and the
+                # start_pos>0 (suffix-prefill) case. Reuse the mask built above
+                # when present; build the start_pos==0 form otherwise so the two
+                # attention paths can never diverge.
+                if attn_mask is not None:
+                    scores = scores + attn_mask
+                else:
+                    total_len = start_pos + seqlen
+                    scores = scores + torch.triu(
+                        torch.full((seqlen, total_len), float("-inf"), device=x.device, dtype=scores.dtype),
+                        diagonal=start_pos + 1,
+                    )
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             out = torch.matmul(scores, v)
 
@@ -1409,18 +1431,82 @@ class Transformer(nn.Module):
     # KV Cache Management (for inference only)
     # =========================================================================
     
-    def setup_caches(self, max_batch_size: int, max_seq_len: int):
+    def setup_caches(self, max_batch_size: int, max_seq_len: int, force: bool = False):
         """
         Allocate KV caches for all layers.
         Must be called before using generate_forward().
-        
+
         Args:
             max_batch_size: Maximum batch size for generation
             max_seq_len: Maximum sequence length (prompt + generated tokens)
+            force: If False (default) and caches are already allocated at a
+                   size >= (max_batch_size, max_seq_len) AND on the expected
+                   device/dtype, this is a no-op so the existing allocation
+                   (and its contents) survive. This is what lets cross-turn
+                   prefix reuse keep the same cache tensors across generations.
+                   Pass force=True to always reallocate (zero-fresh caches).
+
+        Reallocation (force=True, or growing, or a device/dtype change) resets
+        the cache token ledger (`cache_token_ids`) because the prior contents
+        no longer describe a known token sequence.
+
+        Raises:
+            ValueError: if max_seq_len exceeds the model's trained max_seq_len.
+                The RoPE freqs tables (freqs_cos/freqs_sin) are precomputed to
+                exactly params.max_seq_len; positions beyond that have no
+                rotary embedding, so generating there would silently misalign
+                RoPE. Callers must keep context_size <= params.max_seq_len.
         """
+        trained_max = self.params.max_seq_len
+        if max_seq_len > trained_max:
+            raise ValueError(
+                f"setup_caches(max_seq_len={max_seq_len}) exceeds the model's "
+                f"trained max_seq_len={trained_max}. RoPE frequencies are only "
+                f"precomputed to {trained_max} positions; generating beyond that "
+                f"would silently misalign RoPE. Reduce context_size to "
+                f"<= {trained_max}."
+            )
+
         n_kv_heads = self.params.n_heads if self.params.n_kv_heads is None else self.params.n_kv_heads
         head_dim = self.params.dim // self.params.n_heads
-        
+
+        # Idempotent fast path: keep the existing allocation if it's big enough
+        # AND on the right device/dtype. The cached K/V contents (and the token
+        # ledger that describes them) are preserved, which is what cross-turn
+        # prefix reuse relies on. A device/dtype mismatch must NOT no-op: the
+        # cached tensors would be unusable / wrong-precision.
+        same_devdtype = False
+        if not force and self.has_caches():
+            cur_bsz, cur_len = self.cache_capacity()
+            # Check device/dtype of the first non-GDN cache against weights.
+            for layer in self.layers:
+                if getattr(layer, 'use_gdn', False):
+                    continue
+                ck = layer.attention.cache_k
+                w = layer.attention.wq.weight
+                same_devdtype = (ck is not None and ck.device == w.device
+                                 and ck.dtype == w.dtype)
+                break
+            if (cur_bsz is not None and cur_bsz >= max_batch_size
+                    and cur_len >= max_seq_len and same_devdtype):
+                return  # existing allocation already big enough → reuse as-is
+
+        # Decide whether we can GROW IN PLACE while preserving contents. This is
+        # the difference between a block-boundary crossing costing a cheap copy
+        # vs. a full re-prefill of the whole conversation. Growth is safe to
+        # preserve iff: not forced, a cache already exists, same device/dtype,
+        # same batch size, and we are only EXTENDING the seq_len dimension. K/V
+        # at positions [0, old_len) are position-absolute (RoPE baked in), so
+        # copying them into the front of the larger buffer keeps them exact.
+        can_preserve = False
+        old_len = None
+        if not force and self.has_caches() and same_devdtype:
+            cur_bsz, cur_len = self.cache_capacity()
+            if (cur_bsz is not None and cur_bsz == max_batch_size
+                    and cur_len < max_seq_len):
+                can_preserve = True
+                old_len = cur_len
+
         for layer in self.layers:
             if getattr(layer, 'use_gdn', False):
                 continue  # GDN layers have no KV cache
@@ -1428,14 +1514,35 @@ class Transformer(nn.Module):
             device = layer.attention.wq.weight.device
             dtype = layer.attention.wq.weight.dtype
 
-            layer.attention.cache_k = torch.zeros(
+            new_k = torch.zeros(
                 (max_batch_size, max_seq_len, n_kv_heads, head_dim),
                 device=device, dtype=dtype
             )
-            layer.attention.cache_v = torch.zeros(
+            new_v = torch.zeros(
                 (max_batch_size, max_seq_len, n_kv_heads, head_dim),
                 device=device, dtype=dtype
             )
+            if can_preserve:
+                # Copy the still-valid prefix K/V into the larger buffer.
+                old_k = layer.attention.cache_k
+                old_v = layer.attention.cache_v
+                new_k[:, :old_len] = old_k[:, :old_len]
+                new_v[:, :old_len] = old_v[:, :old_len]
+            layer.attention.cache_k = new_k
+            layer.attention.cache_v = new_v
+
+        if can_preserve:
+            # Contents [0, old_len) carried over → the ledger still describes
+            # them correctly. Trim the ledger to old_len just in case it somehow
+            # ran ahead of the physical capacity (it shouldn't), so it never
+            # claims more than was copied.
+            led = self.get_cache_ledger()
+            if len(led) > old_len:
+                self.set_cache_ledger(led[:old_len])
+            # else: ledger already within [0, old_len] — keep it as-is.
+        else:
+            # Truly fresh allocation → any previously remembered ledger is stale.
+            self.reset_cache_ledger()
 
     def clear_caches(self):
         """Free KV cache memory."""
@@ -1449,8 +1556,31 @@ class Transformer(nn.Module):
             layer.attention.cache_k = None
             layer.attention.cache_v = None
 
+        # The cache no longer exists → its token ledger is meaningless.
+        self.reset_cache_ledger()
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # ----- Cache token ledger -------------------------------------------------
+    # The ledger records the exact token IDs physically materialized in cache
+    # positions [0, len(ledger)). It lives on the MODEL, co-located with the
+    # cache tensors it describes, so the two share one lifecycle and cannot
+    # desync: any (re)allocation or clear resets it (see setup_caches /
+    # clear_caches). Cross-turn prefix reuse reads/writes it via these helpers.
+
+    def reset_cache_ledger(self):
+        """Forget the cache token ledger (contents are unknown/stale)."""
+        self._cache_token_ids: list[int] = []
+
+    def get_cache_ledger(self) -> "list[int]":
+        """Token IDs currently materialized in the KV cache, positions [0, N)."""
+        return getattr(self, "_cache_token_ids", [])
+
+    def set_cache_ledger(self, token_ids: "list[int]"):
+        """Record the token IDs now materialized in the cache. Caller must pass
+        EXACTLY the ids physically forwarded into the cache (not trimmed text)."""
+        self._cache_token_ids = list(token_ids)
 
     def has_caches(self) -> bool:
         """Check if KV caches are currently allocated."""
@@ -1458,6 +1588,21 @@ class Transformer(nn.Module):
             if not getattr(layer, 'use_gdn', False):
                 return layer.attention.cache_k is not None
         return False  # all layers are GDN
+
+    def cache_capacity(self):
+        """Return (max_batch_size, max_seq_len) of the currently allocated KV
+        cache, or (None, None) if no cache is allocated.
+
+        Reads the first non-GDN layer's cache_k shape: [bsz, seq_len, n_kv, hd].
+        """
+        for layer in self.layers:
+            if getattr(layer, 'use_gdn', False):
+                continue
+            ck = layer.attention.cache_k
+            if ck is None:
+                return None, None
+            return ck.shape[0], ck.shape[1]
+        return None, None  # all layers are GDN
 
     # =========================================================================
     # Training Forward (identical to original model_v1.py)

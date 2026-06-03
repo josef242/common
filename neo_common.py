@@ -63,6 +63,8 @@ __all__ = [
     "detect_device",
     "load_model_and_tokenizer",
     "stream_generate_kv",
+    "CacheState",
+    "verify_kv_reuse_parity",
     "generate_with_stats",
     "load_yaml_prompt",
     "load_prompt",
@@ -677,10 +679,49 @@ def _find_safe_print_boundary(text: str) -> int:
         return last_lt
 
 
+class CacheState:
+    """KV-cache reuse POLICY for a model, owned by a caller across generations.
+
+    Enables cross-turn *prefix reuse* in stream_generate_kv: when the new
+    prompt shares a token prefix with what is already materialized in the
+    model's KV cache, only the divergent suffix needs to be prefilled.
+
+    Soundness (pure-attention models only): K/V at position p is a pure
+    function of token p and its prefix (RoPE uses absolute positions), so
+    cached K/V for an identical token prefix is bit-identical to a fresh
+    prefill. This is UNSOUND for models with Block-AttnRes (cross-block state
+    not in the KV cache) or GDN/linear-attention layers (recurrent state not
+    in the KV cache), so `reusable` defaults to FALSE — the caller must
+    explicitly opt in only for a verified pure-attention checkpoint.
+
+    NOTE: this object holds ONLY policy (`reusable`). The actual record of
+    which token IDs are materialized in the cache lives on the MODEL
+    (`model.get_cache_ledger()` / `set_cache_ledger()` / `reset_cache_ledger()`),
+    co-located with the cache tensors so the two cannot desync. Any cache
+    (re)allocation or clear resets that ledger automatically; an empty ledger
+    degrades to a full prefill — slow, never wrong.
+    """
+
+    def __init__(self, reusable: bool = False):
+        # Whether prefix reuse is sound for this model (pure attention).
+        # Fail-safe default: OFF unless the caller affirmatively enables it.
+        self.reusable = reusable
+
+
+def _longest_common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest common prefix of two token-ID lists."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_size,
                        temperature, top_p, display=True, stop_on_eos=False, stop_sequences=None,
                        print_prompt=True, return_stop_info=False,
-                       pretty_print=False, role_names=None):
+                       pretty_print=False, role_names=None, cache_state: "CacheState | None" = None,
+                       debug_reuse=False):
     """
     Generates text using KV Caching for O(N) complexity per token.
 
@@ -698,10 +739,14 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
     tokens = tokenizer.encode(prompt_text, bos=True, eos=False)
     prompt_len = len(tokens)
 
+    reuse = (cache_state is not None and cache_state.reusable)
+
     # Bounds check: ensure we don't exceed context size
     if prompt_len >= context_size:
         logger.print_and_log(f"\nError: Prompt length ({prompt_len} tokens) exceeds or equals context size ({context_size} tokens).")
         logger.print_and_log("Please use a shorter prompt or a model with a larger max_seq_len.")
+        if reuse:
+            model.reset_cache_ledger()  # nothing materialized; don't trust stale prefix
         if return_stop_info:
             return "", {"reason": "error", "detail": "prompt exceeds context", "tokens_generated": 0}
         return ""
@@ -714,7 +759,6 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
         max_new_tokens = available_tokens
 
     prompt_ids = tokens.copy()  # Keep a copy for tracking
-    tokens = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
 
     # Track ALL generated token IDs (not just the tensor)
     all_token_ids = prompt_ids.copy()
@@ -722,7 +766,25 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
 
     # 2. Setup Cache
     bsz = 1
+    # The high-water mark this generation may write to.
     total_len = min(context_size, len(all_token_ids) + max_new_tokens)
+
+    # Allocation sizing. For the reuse path we want ONE buffer that survives
+    # across turns, but we do NOT want to pay full-context VRAM from turn 1 when
+    # the conversation is short. Round the working size up to a block so the
+    # buffer grows in coarse steps (each growth reallocates + resets the ledger;
+    # coarse steps keep that rare). The non-reuse path keeps the original tight
+    # sizing. Either way the idempotent setup_caches() only reallocates when the
+    # existing buffer is too small / wrong device-dtype.
+    if reuse:
+        _BLOCK = 1024
+        alloc_len = min(context_size, ((total_len + _BLOCK - 1) // _BLOCK) * _BLOCK)
+    else:
+        alloc_len = total_len
+
+    # NOTE: start_pos and the suffix tensor are computed AFTER setup_caches()
+    # below, because (re)allocation resets the model's cache ledger — the prefix
+    # we may reuse depends on whether the allocation survived or was rebuilt.
 
     # SentencePiece workaround detection
     needs_spm_workaround = isinstance(tokenizer, LlamaTokenizerAdapter)
@@ -760,10 +822,73 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
         last_decoded_full = tokenizer.decode(all_token_ids)
         last_decoded_len = len(last_decoded_full)
 
-    with torch.no_grad():
-        model.setup_caches(max_batch_size=bsz, max_seq_len=total_len)
+    # materialized_len = number of cache positions [0, materialized_len) that
+    # actually hold valid K/V for prompt_ids+generated tokens. Updated only
+    # AFTER each successful forward, so it never counts a sampled-but-not-yet-
+    # forwarded token (the C2 stop/EOS off-by-one). This is the true length to
+    # record in the model ledger.
+    materialized_len = 0
+    # Whether we should persist the ledger on exit (set once allocation+prefill
+    # are known-consistent; cleared on any inconsistency → safe full prefill).
+    persist_ledger = False
 
-        start_pos = 0
+    try:
+      with torch.no_grad():
+        if reuse:
+            # Idempotent: keeps the existing allocation (and its cached prefix
+            # contents) when it's already big enough and on the right
+            # device/dtype; otherwise (re)allocates and resets the ledger.
+            # Sized to a rounded-up working length so the buffer survives
+            # across turns without paying full-context VRAM up front.
+            model.setup_caches(max_batch_size=bsz, max_seq_len=alloc_len)
+        else:
+            # No reuse requested → original behavior: fresh allocation sized
+            # to this generation only.
+            model.setup_caches(max_batch_size=bsz, max_seq_len=total_len, force=True)
+
+        # Compute the reusable prefix AFTER allocation. If setup_caches
+        # reallocated (grew the buffer / device-dtype change / first alloc),
+        # it reset the ledger to [], so the prefix is empty and we full-
+        # prefill. If it no-op'd (buffer survived), the ledger still
+        # describes the live cache contents and we can reuse them.
+        if reuse:
+            ledger = model.get_cache_ledger()
+            prefix_len = _longest_common_prefix_len(ledger, prompt_ids)
+            # Leave >=1 token to forward (need fresh logits to sample from;
+            # also handles new-prompt-is-strict-prefix, e.g. /rep truncation).
+            start_pos = min(prefix_len, prompt_len - 1)
+            if debug_reuse:
+                # Observability: how much of the prompt was served from cache vs
+                # re-prefilled, AND a hint at WHY reuse was limited this turn:
+                #   * ledger==0      → cache was (re)allocated fresh this turn
+                #                      (first turn, device/dtype change, or a
+                #                      non-preserving realloc). Should be rare now
+                #                      that growth preserves contents.
+                #   * reused<<ledger → the prompt diverged from the cached tokens
+                #                      early (history edited, trimmed from the
+                #                      front, or stored text didn't round-trip).
+                #   * reused≈ledger  → healthy: only the new tail is re-prefilled.
+                reprefill = prompt_len - start_pos
+                if len(ledger) == 0:
+                    why = "fresh-alloc"
+                elif start_pos < len(ledger) - 2:  # diverged before ledger end
+                    why = f"diverged@{start_pos}/{len(ledger)} (edit/trim?)"
+                else:
+                    why = "healthy"
+                logger.print_and_log(
+                    f"[kv-reuse] prompt={prompt_len} reused={start_pos} "
+                    f"reprefill={reprefill} ledger={len(ledger)} -> {why}"
+                )
+        else:
+            start_pos = 0
+
+        # Positions [0, start_pos) are served from existing cache contents;
+        # forward only the divergent suffix on the first pass.
+        suffix_ids = prompt_ids[start_pos:]
+        tokens = torch.tensor(suffix_ids, dtype=torch.long, device=device).unsqueeze(0)
+        # Everything in [0, start_pos) is (by construction of the LCP against
+        # the ledger) already materialized in the cache.
+        materialized_len = start_pos
 
         if display and print_prompt:
             if pretty_print and role_names:
@@ -788,6 +913,12 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
 
                 # Forward pass (works with both old and new model interface)
                 logits, _ = model(tokens, start_pos=start_pos)
+                # These suffix positions are now physically in the cache. Record
+                # the TRUE materialized length here (after the forward), so a
+                # token that gets sampled below but never forwarded (stop/EOS on
+                # the next break) is NOT counted. This is the fix for the C2
+                # off-by-one that previously corrupted the next turn's reuse.
+                materialized_len = start_pos + tokens.shape[1]
 
                 # Select last token logits
                 next_token_logits = logits[0, -1, :]
@@ -811,7 +942,7 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
                     next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
                 next_token_id = next_token.item()
-                
+
                 # Store the generated token
                 generated_tokens.append(next_token_id)
                 all_token_ids.append(next_token_id)
@@ -889,20 +1020,57 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
                     stop_reason = {"reason": "eos", "detail": f"token_id={tokenizer.eos_id}", "tokens_generated": i + 1}
                     break
 
-    # Print any remaining buffer (if we didn't hit a stop sequence)
-    if display and print_buffer and not stop_sequence_hit:
-        to_print = print_buffer
-        if pretty_print and role_names:
-            to_print = _prettify_special_tokens(to_print, role_names)
-        print(to_print, end="", flush=True)
+        # Print any remaining buffer (if we didn't hit a stop sequence)
+        if display and print_buffer and not stop_sequence_hit:
+            to_print = print_buffer
+            if pretty_print and role_names:
+                to_print = _prettify_special_tokens(to_print, role_names)
+            print(to_print, end="", flush=True)
 
-    # Update tokens_generated for max_tokens case (loop completed naturally)
-    if stop_reason["reason"] == "max_tokens":
-        stop_reason["tokens_generated"] = len(generated_tokens)
-        stop_reason["detail"] = f"reached limit of {max_new_tokens}"
+        # Update tokens_generated for max_tokens case (loop completed naturally)
+        if stop_reason["reason"] == "max_tokens":
+            stop_reason["tokens_generated"] = len(generated_tokens)
+            stop_reason["detail"] = f"reached limit of {max_new_tokens}"
 
-    # Clean up memory
-    model.clear_caches()
+        # Generation completed without an exception → the ledger is consistent
+        # with what we physically forwarded, so it's safe to persist on the
+        # reuse path. (For non-reuse we clear the cache in finally instead.)
+        persist_ledger = True
+
+    except Exception as _gen_exc:
+        # Make a reuse-path failure VISIBLE rather than silently degrading.
+        # The most likely culprit is a CUDA OOM while (re)allocating or growing
+        # the KV cache — common on tightly-packed multi-GPU balanced shards,
+        # where the held full-context cache isn't in the sharding budget. We
+        # log a clear, attributable warning and re-raise so the caller still
+        # handles it; the `finally` below resets the ledger so the next turn is
+        # safe.
+        if reuse:
+            logger.print_and_log(
+                f"\n[kv-reuse] generation failed ({type(_gen_exc).__name__}: {_gen_exc}). "
+                f"KV-cache reuse state has been reset; the next turn will full-prefill. "
+                f"If this is a CUDA OOM on a sharded model, reduce context/gen size or "
+                f"run on fewer/larger GPUs."
+            )
+        raise
+    finally:
+        # C6: this runs even if the forward raised (OOM, etc.). On the reuse
+        # path we KEEP the allocation across turns, but the ledger must only
+        # describe what was actually materialized:
+        #   * clean completion → record all_token_ids[:materialized_len], i.e.
+        #     the forwarded prefix MINUS any sampled-but-unforwarded stop/EOS
+        #     token (C2). materialized_len is exact because it's bumped only
+        #     after each successful forward.
+        #   * exception mid-forward → don't trust partial writes; reset ledger.
+        if reuse:
+            if persist_ledger:
+                model.set_cache_ledger(all_token_ids[:materialized_len])
+            else:
+                model.reset_cache_ledger()
+            # Keep the allocation (don't clear) so it survives to the next turn.
+        else:
+            # No reuse: original behavior — free the cache between calls.
+            model.clear_caches()
 
     # Return the generated text
     # If we tracked it for stop sequences, use that (already trimmed correctly)
@@ -916,6 +1084,127 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
         return generated_text, stop_reason
     else:
         return generated_text
+
+
+def verify_kv_reuse_parity(model, tokenizer, context_size,
+                           base_text="The quick brown fox jumps over the lazy dog. ",
+                           turn1_suffix="It was a bright cold day in April. ",
+                           turn2_suffix="The clocks were striking thirteen. ",
+                           gen_steps=8, atol=1e-3, verbose=True):
+    """Prove cross-turn KV-cache prefix reuse is bit-exact (within fp noise).
+
+    Strategy: simulate two turns that share a long token prefix, then compare
+    the model's next-token logits produced via the REUSE path against a fresh
+    FULL-prefill reference at every generated step. If reused-prefix K/V were
+    wrong (e.g. the C1 mask bug, or a C2/C4 ledger desync), the logits diverge
+    immediately and we report the first failing step.
+
+    This is deterministic (argmax greedy, no RNG), so it catches correctness
+    regressions that temperature>0 smoke testing would mask.
+
+    Returns (ok: bool, detail: str).
+    """
+    import neo_common as _self  # for CacheState
+
+    device = next(model.parameters()).device
+
+    def _greedy_ids_and_first_logits(prompt_text, cache_state):
+        """Generate gen_steps tokens greedily via the model's cached path,
+        honoring cache_state (reuse or not). Returns (generated_ids,
+        logits_per_step) where logits_per_step[k] is the full next-token logit
+        vector the model produced at generation step k. Mirrors the core of
+        stream_generate_kv but headless and id-level."""
+        ids = tokenizer.encode(prompt_text, bos=True, eos=False)
+        prompt_len = len(ids)
+        reuse = cache_state is not None and cache_state.reusable
+        bsz = 1
+        total_len = min(context_size, prompt_len + gen_steps)
+        if reuse:
+            _BLOCK = 1024
+            alloc_len = min(context_size, ((total_len + _BLOCK - 1) // _BLOCK) * _BLOCK)
+        else:
+            alloc_len = total_len
+
+        gen_ids = []
+        step_logits = []
+        try:
+            with torch.no_grad():
+                if reuse:
+                    model.setup_caches(max_batch_size=bsz, max_seq_len=alloc_len)
+                    ledger = model.get_cache_ledger()
+                    p = _longest_common_prefix_len(ledger, ids)
+                    start_pos = min(p, prompt_len - 1)
+                else:
+                    model.setup_caches(max_batch_size=bsz, max_seq_len=total_len, force=True)
+                    start_pos = 0
+
+                cur = torch.tensor(ids[start_pos:], dtype=torch.long, device=device).unsqueeze(0)
+                materialized = start_pos
+                all_ids = list(ids)
+                for _ in range(gen_steps):
+                    if start_pos + cur.shape[1] > context_size:
+                        break
+                    logits, _u = model(cur, start_pos=start_pos)
+                    materialized = start_pos + cur.shape[1]
+                    nxt_logits = logits[0, -1, :].float()
+                    step_logits.append(nxt_logits)
+                    nxt = int(torch.argmax(nxt_logits).item())
+                    gen_ids.append(nxt)
+                    all_ids.append(nxt)
+                    start_pos += cur.shape[1]
+                    cur = torch.tensor([[nxt]], dtype=torch.long, device=device)
+            if reuse:
+                model.set_cache_ledger(all_ids[:materialized])
+            else:
+                model.clear_caches()
+        except Exception:
+            if reuse:
+                model.reset_cache_ledger()
+            else:
+                model.clear_caches()
+            raise
+        return gen_ids, step_logits
+
+    prompt1 = base_text + turn1_suffix
+    prompt2 = base_text + turn1_suffix + turn2_suffix  # shares prompt1 as a prefix
+
+    # Reference: reuse OFF, fresh full prefill of the turn-2 prompt.
+    ref_state = _self.CacheState(reusable=False)
+    ref_ids, ref_logits = _greedy_ids_and_first_logits(prompt2, ref_state)
+
+    # Reuse path: turn 1 populates the ledger, turn 2 exercises prefix reuse.
+    model.reset_cache_ledger()
+    reuse_state = _self.CacheState(reusable=True)
+    _greedy_ids_and_first_logits(prompt1, reuse_state)          # warm the cache
+    reuse_ids, reuse_logits = _greedy_ids_and_first_logits(prompt2, reuse_state)
+
+    # Compare per-step next-token logits and the resulting greedy ids.
+    n = min(len(ref_logits), len(reuse_logits))
+    max_abs = 0.0
+    first_bad = None
+    for k in range(n):
+        d = (ref_logits[k] - reuse_logits[k]).abs().max().item()
+        max_abs = max(max_abs, d)
+        if (ref_ids[k] != reuse_ids[k] or d > atol) and first_bad is None:
+            first_bad = (k, ref_ids[k], reuse_ids[k], d)
+
+    ok = first_bad is None and ref_ids[:n] == reuse_ids[:n]
+    if ok:
+        detail = (f"PASS: reuse matches full prefill over {n} steps "
+                  f"(max |Δlogit|={max_abs:.2e}, atol={atol:g}). "
+                  f"ids={reuse_ids[:n]}")
+    else:
+        k, ri, ui, d = first_bad
+        detail = (f"FAIL at step {k}: ref_id={ri} reuse_id={ui} "
+                  f"|Δlogit|={d:.2e} (max over run {max_abs:.2e}). "
+                  f"ref_ids={ref_ids[:n]} reuse_ids={reuse_ids[:n]}")
+
+    # Leave the cache clean so a live session isn't polluted by the probe.
+    model.clear_caches()
+
+    if verbose:
+        logger.print_and_log("[kv-reuse parity] " + detail)
+    return ok, detail
 
 
 def generate_with_stats(model, tokenizer, prompt_text, max_new_tokens,
