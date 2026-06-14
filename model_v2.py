@@ -54,13 +54,7 @@ except Exception:
                              **kw):
         logits = hidden @ weight.t()
         ignore_index = kw.get("ignore_index", -100)
-        loss = F.cross_entropy(logits, targets, reduction=reduction, ignore_index=ignore_index)
-        if kw.get("return_lse"):
-            # Per-token logsumexp [N] in fp32 to match the real CCE's
-            # return_lse contract (cut_cross_entropy returns (loss, lse)).
-            # Reuses the logits already materialized here — no extra alloc.
-            return loss, torch.logsumexp(logits.float(), dim=-1)
-        return loss
+        return F.cross_entropy(logits, targets, reduction=reduction, ignore_index=ignore_index)
 
 
 @torch._dynamo.disable
@@ -69,29 +63,71 @@ def cce_loss(hidden, weight, targets, **kwargs):
     return linear_cross_entropy(hidden, weight, targets, **kwargs)
 
 
-def _masked_zloss(lse: torch.Tensor, tgt_flat: torch.Tensor, pad_id: int):
-    """z-loss statistics from the per-token logsumexp `lse`.
+def _zloss_optionD(h_flat, weight, tgt_flat, pad_id, fp32_accum):
+    """Differentiable z-loss statistics with NO [N,V] logits materialization.
 
     Returns (zloss, logz) = (mean(logZ**2), mean(logZ)) over non-pad tokens,
-    using the SAME non-ignored token set and mean reduction as CCE's
-    cross-entropy (ignore_index=pad_id), so the z term is consistent with CE.
+    where logZ is the per-token logsumexp of the (never-materialized) logits.
 
-    Implementation notes:
-    - Mask-MULTIPLY (not boolean indexing): keeps static tensor shapes, is
-      torch.compile-safe, and yields exactly 0 for an all-pad micro-batch
-      (denom clamped to 1, numerator 0) instead of mean-of-empty -> NaN.
-    - lse is cast to fp32 before squaring: a logZ of O(10) squared is O(100),
-      which loses precision in bf16; the penalty and its gradient must be fp32.
-    - Asserts lse is full-length [N] (one entry per flattened token, incl.
-      pads) so a CCE build that returns a compacted lse fails LOUD here rather
-      than silently mis-masking against the full-length target tensor.
+    The installed CCE (25.4.3) does NOT expose `return_lse`, so we reconstruct
+    logZ from the identity  CE_per_token = logZ - logit_target  =>
+        logZ = CE_none + logit_target
+    using two pieces that each avoid the [N,V] logits tensor:
+      - CE_none = linear_cross_entropy(reduction='none')  — CCE fused, differentiable.
+      - logit_target = (h . W[target]) = (h * W[target_rows]).sum(-1). The gather
+        W[targets] is [N, D] (same footprint as h), NOT [N, V].
+
+    Precision (`fp32_accum`, set by the z_loss backend):
+      - The reconstruction is a catastrophic cancellation: CE_none = logZ -
+        logit_target with logZ, logit_target both ~O(8) and CE ~O(small). In
+        bf16 the lost low-order bits make the z-loss GRADIENT ~0.99 cosine /
+        ~12% norm-rel vs the fp32 truth (the forward logZ is fine). The
+        cancellation happens INSIDE the CCE kernel, so a python-side .float()
+        on the returned (already-fp32) CE_none cannot recover it.
+      - backend='fp32_accum' passes CCE's accum_e_fp32/accum_c_fp32, forcing
+        fp32 accumulation of the e/c gradient contractions INSIDE the CCE
+        backward — where the cancelling target-class term is computed. Measured
+        on rig (CCE 25.4.3): grad cosine 0.990 -> 0.999, norm-rel ~0.12 -> ~0.05,
+        at ~+0.45 GB peak vs bf16 at dreadnought's head shape.
+      - backend='bf16' (fp32_accum=False) accepts the ~0.99-cosine gradient for
+        the lightest memory. Fine for a small annealed regularizer.
+
+    Notes:
+      - safe_targets: pad/ignore_index rows are clamped to row 0 for the gather
+        (W[ignore_index] would mis-gather/crash for a non-vocab ignore_index like
+        -100) and masked out of the zloss, so the bogus value never contributes.
+      - VOCAB-PARALLEL CAVEAT: this manual W[targets] gather does NOT inherit
+        CCE's vocab-parallel target remapping / rank-local handling. We are not
+        vocab-parallel today; if VP is ever enabled, this gather must mirror
+        CCE's target handling (rank-local vocab offset / valid mask).
+      - Mask-MULTIPLY (not boolean indexing): static shapes, torch.compile-safe,
+        and all-pad micro-batch -> exactly 0 (denom clamped) instead of NaN.
+      - logZ is squared in fp32 (logZ ~O(10) -> O(100) loses bf16 precision).
     """
-    assert lse.numel() == tgt_flat.numel(), (
-        f"return_lse length {lse.numel()} != tokens {tgt_flat.numel()}; "
-        f"CCE returned a compacted lse — z-loss masking assumes full-length [N]."
-    )
+    out_dtype = weight.dtype
+    if h_flat.dtype != out_dtype:
+        h_flat = h_flat.to(out_dtype)
+
+    kw = dict(reduction="none", ignore_index=pad_id)
+    if fp32_accum:
+        kw.update(accum_e_fp32=True, accum_c_fp32=True)
+    ce_none = cce_loss(h_flat, weight, tgt_flat, **kw)        # [N], differentiable
+
+    # safe_targets: rows we mask out of the z-loss are clamped into [0, vocab)
+    # for the gather so a non-vocab ignore_index (e.g. -100) can't index out of
+    # bounds. `valid` mirrors CE's ignored set (ignore_index == pad_id), so the
+    # z-loss uses exactly the same token set as the CE it is consistent with;
+    # the clamp additionally guards against any out-of-range index in those
+    # already-excluded rows (their gathered value is discarded by the mask).
+    vocab = weight.shape[0]
+    valid = tgt_flat != pad_id
+    safe_targets = tgt_flat.masked_fill(~valid, 0).clamp_(0, vocab - 1)
+    w_rows = weight.index_select(0, safe_targets)            # [N, D] gather (NOT [N, V])
+    logit_target = (h_flat * w_rows).sum(-1)                 # [N], differentiable
+
+    lse = ce_none + logit_target                             # = logZ per token
     lse_f = lse.float()
-    keep = (tgt_flat != pad_id).to(lse_f.dtype)
+    keep = valid.to(lse_f.dtype)
     denom = keep.sum().clamp_min(1.0)
     zloss = (lse_f * lse_f * keep).sum() / denom
     logz = (lse_f * keep).sum() / denom
@@ -163,15 +199,17 @@ class AuxHead(nn.Module):
         self.norm = RMSNorm(dim, eps=norm_eps)
         self.linear = nn.Linear(dim, vocab_size, bias=False)
 
-    def forward(self, h_tap, tgt_flat, pad_id, compute_zloss: bool = False):
-        """Compute CE loss at this tap point via fused CCE kernel.
+    def forward(self, h_tap, tgt_flat, pad_id, zloss_fp32_accum=None):
+        """Compute CE loss at this tap point via the fused CCE kernel.
 
-        Returns (loss, zloss, logz). zloss/logz are None unless
-        compute_zloss=True, in which case (over non-pad tokens):
-            zloss = mean(logZ**2),  logz = mean(logZ)
-        for the per-token logsumexp logZ surfaced by CCE's return_lse path.
-        When compute_zloss is False the call is byte-for-byte the original
-        single cce_loss (no return_lse) and the loss tensor is identical.
+        Returns (loss, zloss, logz). z-loss is computed only when
+        `zloss_fp32_accum` is not None (i.e. the trainer requested it):
+            None  -> no z-loss; the CE call is byte-for-byte the original path,
+                     loss tensor identical to baseline.
+            False -> z-loss via option D, bf16 reconstruction (lightest memory).
+            True  -> z-loss via option D, fp32 accumulation in the CCE backward
+                     (near-exact gradient, ~+0.45 GB at the head shape).
+        See _zloss_optionD for the reconstruction + precision rationale.
         """
         h_norm = self.norm(h_tap)
         h_flat = h_norm.reshape(-1, h_norm.size(-1))
@@ -179,18 +217,7 @@ class AuxHead(nn.Module):
         if h_flat.dtype != out_dtype:
             h_flat = h_flat.to(out_dtype)
         accum_fp32 = out_dtype == torch.float32
-        if not compute_zloss:
-            loss = cce_loss(
-                h_flat,
-                self.linear.weight,
-                tgt_flat,
-                accum_e_fp32=accum_fp32,
-                accum_c_fp32=accum_fp32,
-                reduction="mean",
-                ignore_index=pad_id,
-            )
-            return loss, None, None
-        loss, lse = cce_loss(
+        loss = cce_loss(
             h_flat,
             self.linear.weight,
             tgt_flat,
@@ -198,9 +225,12 @@ class AuxHead(nn.Module):
             accum_c_fp32=accum_fp32,
             reduction="mean",
             ignore_index=pad_id,
-            return_lse=True,
         )
-        zloss, logz = _masked_zloss(lse, tgt_flat, pad_id)
+        if zloss_fp32_accum is None:
+            return loss, None, None
+        zloss, logz = _zloss_optionD(
+            h_flat, self.linear.weight, tgt_flat, pad_id, zloss_fp32_accum
+        )
         return loss, zloss, logz
 
 
@@ -1399,13 +1429,15 @@ class Transformer(nn.Module):
         self._aux_head_layer_set: set = set(self.aux_head_layers)
         self._last_aux_loss_tensors: dict = {}
         # Z-loss (confidence penalty on logsumexp). Disabled by default; the
-        # trainer sets self._compute_zloss=True post-build when settings.z_loss
-        # is enabled. When False, NOTHING extra runs (return_lse stays False)
-        # and the loss path is byte-for-byte identical to baseline. Stashes
-        # mirror _last_aux_loss_tensors: per-head dicts for aux heads, scalars
-        # for the main head. The trainer selects whichever matches the live
-        # readout (main head normally, deepest aux tap under SCS scaffold).
-        self._compute_zloss: bool = False
+        # trainer sets self._zloss_fp32_accum post-build when settings.z_loss is
+        # enabled:
+        #     None  -> z-loss OFF; loss path byte-for-byte identical to baseline.
+        #     False -> z-loss ON, backend='bf16'       (option D, bf16 recon).
+        #     True  -> z-loss ON, backend='fp32_accum' (option D, fp32 accum).
+        # Stashes mirror _last_aux_loss_tensors: per-head dicts for aux heads,
+        # scalars for the main head. The trainer selects whichever matches the
+        # live readout (main head normally, deepest aux tap under SCS scaffold).
+        self._zloss_fp32_accum = None    # None=off | False=bf16 | True=fp32_accum
         self._last_zloss = None          # main-head raw zloss = mean(logZ**2)
         self._last_logz = None           # main-head logZ_mean = mean(logZ)
         self._last_aux_zloss: dict = {}  # per-aux-head raw zloss
@@ -1805,11 +1837,13 @@ class Transformer(nn.Module):
             # a prior full-depth forward (e.g. baseline val) can never be
             # reused by the trainer. Only compute z-loss during training — the
             # model is .eval() in validation, where the z stats are unused, so
-            # gating on self.training also skips the extra return_lse work
-            # there (and keeps val display-only / unchanged).
+            # gating on self.training also skips the extra z-loss work there
+            # (and keeps val display-only / unchanged). _zloss_fp32_accum is
+            # None when z-loss is off (then this branch is byte-identical to
+            # baseline), else False=bf16 / True=fp32_accum backend.
             self._last_zloss = None
             self._last_logz = None
-            _want_zloss = self._compute_zloss and self.training
+            _want_zloss = (self._zloss_fp32_accum is not None) and self.training
 
             if scaffold_mode:
                 # No main loss to compute. Aux losses below are still computed
@@ -1827,29 +1861,24 @@ class Transformer(nn.Module):
                     h_flat = h_flat.to(out_dtype)
 
                 accum_fp32 = out_dtype == torch.float32
-                if not _want_zloss:
-                    loss = cce_loss(
-                        h_flat,
-                        self.output.weight,
-                        tgt_flat,
-                        accum_e_fp32=accum_fp32,
-                        accum_c_fp32=accum_fp32,
-                        reduction="mean",
-                        ignore_index=pad_id,
-                    )
-                else:
-                    loss, _lse = cce_loss(
-                        h_flat,
-                        self.output.weight,
-                        tgt_flat,
-                        accum_e_fp32=accum_fp32,
-                        accum_c_fp32=accum_fp32,
-                        reduction="mean",
-                        ignore_index=pad_id,
-                        return_lse=True,
-                    )
-                    self._last_zloss, self._last_logz = _masked_zloss(
-                        _lse, tgt_flat, pad_id
+                # Main LM loss is ALWAYS pure CE (reduction='mean'), identical
+                # to baseline whether or not z-loss is on — the z term is a
+                # SEPARATE stashed quantity the trainer adds to the objective.
+                loss = cce_loss(
+                    h_flat,
+                    self.output.weight,
+                    tgt_flat,
+                    accum_e_fp32=accum_fp32,
+                    accum_c_fp32=accum_fp32,
+                    reduction="mean",
+                    ignore_index=pad_id,
+                )
+                if _want_zloss:
+                    # Option D: no [N,V] materialization. Backend bool selects
+                    # CCE fp32 accumulation in its backward (see _zloss_optionD).
+                    self._last_zloss, self._last_logz = _zloss_optionD(
+                        h_flat, self.output.weight, tgt_flat, pad_id,
+                        self._zloss_fp32_accum,
                     )
 
             # MoE balance losses: fold in from layers that actually ran this
@@ -1888,17 +1917,19 @@ class Transformer(nn.Module):
                 # which tap the trainer will pick (scs_deepest_tap lives in
                 # the trainer), so every fired aux head stashes its z-loss
                 # when enabled; the trainer selects the deepest one. Gated on
-                # self.training so validation skips the extra return_lse work.
-                _aux_want_zloss = self._compute_zloss and self.training
+                # self.training so validation skips the extra z-loss work.
+                # Pass the backend bool (False=bf16/True=fp32_accum) when on,
+                # None when off (z-loss disabled, or eval).
+                _aux_zfp32 = (self._zloss_fp32_accum if self.training else None)
                 for li, h_tap in aux_taps.items():
                     # Call through __call__ so FSDP unshard/reshard hooks
                     # fire. AuxHead.forward signature is
-                    # (h_tap, tgt_flat, pad_id, compute_zloss) — it does its
+                    # (h_tap, tgt_flat, pad_id, zloss_fp32_accum) — it does its
                     # own RMSNorm + CCE on the flattened (B*S,) target tensor
                     # and returns (loss, zloss, logz). zloss/logz are None
-                    # unless compute_zloss=True.
+                    # unless zloss_fp32_accum is not None.
                     _l, _z, _lz = self.aux_heads[str(li)](
-                        h_tap, _tgt_flat, pad_id, _aux_want_zloss
+                        h_tap, _tgt_flat, pad_id, _aux_zfp32
                     )
                     new_aux_losses[li] = _l
                     if _z is not None:
