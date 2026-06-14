@@ -124,12 +124,28 @@ class Logger:
         """Block until all queued messages have been written.
 
         Returns True if the queue drained, False if the timeout expired.
+
+        timeout=None waits indefinitely. A finite timeout is honored even
+        though queue.Queue.join() has no native timeout: we poll the
+        unfinished-task count. This matters at exit — if the log file/NAS is
+        unreachable the writer thread retries with backoff and never calls
+        task_done(), so an unbounded join() would hang the process on shutdown.
         """
         if self._writer_queue is None:
             return True
         try:
-            self._writer_queue.join()
-            return True
+            if timeout is None:
+                self._writer_queue.join()
+                return True
+            # Bounded wait: poll the internal unfinished-tasks counter.
+            deadline = time.time() + timeout
+            q = self._writer_queue
+            while time.time() < deadline:
+                # unfinished_tasks is decremented by task_done(); 0 == drained.
+                if getattr(q, "unfinished_tasks", 0) == 0:
+                    return True
+                time.sleep(0.01)
+            return getattr(q, "unfinished_tasks", 0) == 0
         except Exception:
             return False
 
@@ -171,7 +187,12 @@ class Logger:
 
         self._server = threading.Thread(target=_serve, daemon=True, name='LoggerServer')
         self._server.start()
-        atexit.register(self._server.join, timeout=0.2)
+        # Drain the WRITER queue at exit so the last queued log lines aren't lost
+        # when the (daemon) writer thread is killed on interpreter shutdown. The
+        # old code joined the server thread, which runs an infinite accept loop
+        # and so never terminates — it drained nothing. Bounded so a downed log
+        # target can't hang shutdown.
+        atexit.register(self.flush, timeout=2.0)
 
     def _writer_worker(self):
         """Single thread that handles ALL stdout and file writes."""
