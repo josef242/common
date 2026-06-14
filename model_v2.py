@@ -129,9 +129,20 @@ def _zloss_optionD(h_flat, weight, tgt_flat, pad_id, fp32_accum):
     lse_f = lse.float()
     keep = valid.to(lse_f.dtype)
     denom = keep.sum().clamp_min(1.0)
-    zloss = (lse_f * lse_f * keep).sum() / denom
-    logz = (lse_f * keep).sum() / denom
-    return zloss, logz
+    zloss = (lse_f * lse_f * keep).sum() / denom             # mean(logZ**2), differentiable
+    logz = (lse_f * keep).sum() / denom                      # mean(logZ),    differentiable
+
+    # Diagnostics (detached, logging only): rms = sqrt(mean logZ**2) = sqrt(zloss);
+    # p95 over the valid tokens shows the tail of the partition function (the
+    # outliers z-loss is meant to pull in), which the mean alone hides.
+    with torch.no_grad():
+        logz_rms = zloss.detach().clamp_min(0).sqrt()
+        valid_lse = lse_f[valid]
+        if valid_lse.numel() > 0:
+            logz_p95 = torch.quantile(valid_lse, 0.95)
+        else:
+            logz_p95 = lse_f.new_zeros(())
+    return zloss, logz, logz_rms, logz_p95
 
 
 # ----------------------------------------------------------------------------
@@ -228,7 +239,10 @@ class AuxHead(nn.Module):
         )
         if zloss_fp32_accum is None:
             return loss, None, None
-        zloss, logz = _zloss_optionD(
+        # rms/p95 diagnostics are surfaced only for the main head (see the
+        # Transformer.forward main branch); aux taps return mean only — rms is
+        # derivable as sqrt(zloss) by the trainer if ever needed for a tap.
+        zloss, logz, _rms, _p95 = _zloss_optionD(
             h_flat, self.linear.weight, tgt_flat, pad_id, zloss_fp32_accum
         )
         return loss, zloss, logz
@@ -1440,6 +1454,8 @@ class Transformer(nn.Module):
         self._zloss_fp32_accum = None    # None=off | False=bf16 | True=fp32_accum
         self._last_zloss = None          # main-head raw zloss = mean(logZ**2)
         self._last_logz = None           # main-head logZ_mean = mean(logZ)
+        self._last_logz_rms = None       # main-head logZ rms = sqrt(mean logZ**2)
+        self._last_logz_p95 = None       # main-head logZ 95th pctile (tail)
         self._last_aux_zloss: dict = {}  # per-aux-head raw zloss
         self._last_aux_logz: dict = {}   # per-aux-head logZ_mean
 
@@ -1843,6 +1859,8 @@ class Transformer(nn.Module):
             # baseline), else False=bf16 / True=fp32_accum backend.
             self._last_zloss = None
             self._last_logz = None
+            self._last_logz_rms = None
+            self._last_logz_p95 = None
             _want_zloss = (self._zloss_fp32_accum is not None) and self.training
 
             if scaffold_mode:
@@ -1876,7 +1894,8 @@ class Transformer(nn.Module):
                 if _want_zloss:
                     # Option D: no [N,V] materialization. Backend bool selects
                     # CCE fp32 accumulation in its backward (see _zloss_optionD).
-                    self._last_zloss, self._last_logz = _zloss_optionD(
+                    (self._last_zloss, self._last_logz,
+                     self._last_logz_rms, self._last_logz_p95) = _zloss_optionD(
                         h_flat, self.output.weight, tgt_flat, pad_id,
                         self._zloss_fp32_accum,
                     )
