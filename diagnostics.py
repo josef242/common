@@ -760,7 +760,7 @@ class LayerDiagnostics:
     def log_diagnostics(self, step: int, log_dir: str, total_tokens: int = 0,
                          filename: str = "diagnostics.jsonl",
                          awd_data: dict = None, moe_data: dict = None,
-                         activation_data: dict = None):
+                         activation_data: dict = None, zloss_data: dict = None):
         """
         Compute diagnostics and write to JSONL file.
         Only rank 0 writes to the file.
@@ -815,6 +815,13 @@ class LayerDiagnostics:
                         for lid, pct, cv, bias in moe_data['per_layer']
                     ]
                 }
+
+            # Include z-loss stats when provided (z-loss enabled). Snapshot of
+            # the latest per-step values, recorded at this val cadence so the
+            # dashboard gets a structured time series alongside the other
+            # diagnostics. Per-step resolution still lives in train_log.txt.
+            if zloss_data is not None:
+                data['z_loss'] = zloss_data
 
             # Merge forward-activation RMS profile when provided.
             if activation_data is not None:
