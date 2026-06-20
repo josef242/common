@@ -760,7 +760,8 @@ class LayerDiagnostics:
     def log_diagnostics(self, step: int, log_dir: str, total_tokens: int = 0,
                          filename: str = "diagnostics.jsonl",
                          awd_data: dict = None, moe_data: dict = None,
-                         activation_data: dict = None, zloss_data: dict = None):
+                         activation_data: dict = None, zloss_data: dict = None,
+                         rc_data: dict = None):
         """
         Compute diagnostics and write to JSONL file.
         Only rank 0 writes to the file.
@@ -822,6 +823,14 @@ class LayerDiagnostics:
             # diagnostics. Per-step resolution still lives in train_log.txt.
             if zloss_data is not None:
                 data['z_loss'] = zloss_data
+
+            # Include row-center (gauge subtraction) stats when provided. Same
+            # val-cadence snapshot pattern as z_loss: muW_pre is the per-step
+            # gauge regrowth rate (the real diagnostic), muW_post ~0 confirms the
+            # projection took, m_bar is the 1st-moment gauge, proj_ratio is the
+            # gauge's relative size in the head.
+            if rc_data is not None:
+                data['row_center'] = rc_data
 
             # Merge forward-activation RMS profile when provided.
             if activation_data is not None:
