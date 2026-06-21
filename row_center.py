@@ -165,6 +165,68 @@ def row_center_head_(weight, exp_avg=None, vocab_dim=0):
 
 
 @torch.no_grad()
+def capture_gauge(weight, exp_avg=None, vocab_dim=0):
+    """Capture the current global gauge vectors at warmup start: mu0 = row-mean
+    of the head weight, mbar0 = row-mean of the Adam first moment. Returned as
+    fp32 CPU tensors (small, [D]) so they can be checkpointed and restored on a
+    mid-warmup resume WITHOUT re-deriving from already-partially-centered weights
+    (Guardrail 1). exp_avg may be None (head's first step not yet taken)."""
+    mu0, _ = _global_row_mean(weight, vocab_dim)
+    out = {"mu0": mu0.detach().float().cpu()}
+    if exp_avg is not None:
+        mbar0, _ = _global_row_mean(exp_avg, vocab_dim)
+        out["mbar0"] = mbar0.detach().float().cpu()
+    else:
+        out["mbar0"] = None
+    return out
+
+
+@torch.no_grad()
+def row_center_head_warmup_(weight, s, mu0, exp_avg=None, mbar0=None, vocab_dim=0):
+    """TARGET-GAUGE warmup projection (staged transition Stage 2, Req 2). Pins the
+    stored gauge to a SCHEDULED value rather than fighting Adam's re-injection to
+    an implicit equilibrium:
+
+        mu_target  = (1 - s) * mu0
+        W        <- W       - 1 * (mean_vocab(W)       - mu_target)^T
+        mbar_target = (1 - s) * mbar0
+        exp_avg  <- exp_avg - 1 * (mean_vocab(exp_avg) - mbar_target)^T
+
+    s in [0,1] from the warmup schedule. At s=0: mu_target=mu0 -> projection is a
+    NO-OP (starts clean). At s=1: mu_target=0 -> fully centered (steady-state).
+    Each step pins the stored mean to exactly mu_target regardless of how hard
+    Adam re-injected since last step. exp_avg uses ITS OWN captured mbar0; second
+    moment untouched. mu0/mbar0 are the START-OF-WARMUP gauges (captured once,
+    checkpoint-persisted), NOT recomputed — that's what makes the ramp stable.
+
+    Returns telemetry: mu_w_pre/post (||row-mean(W)|| before/after this step),
+    m_bar (||row-mean(exp_avg)|| before), s, plus the target norms for logging."""
+    dev_mu0 = mu0
+    mu_now, V = _global_row_mean(weight, vocab_dim)
+    mu_w_pre = mu_now.norm().item()
+    mu_target = (1.0 - s) * dev_mu0.to(mu_now.device)
+    # subtract (current_mean - target) from every row -> stored mean becomes target
+    _subtract_row_mean_(weight, mu_now - mu_target, vocab_dim)
+    mu_after, _ = _global_row_mean(weight, vocab_dim)
+    mu_w_post = mu_after.norm().item()
+
+    m_bar = None
+    if exp_avg is not None and mbar0 is not None:
+        mbar_now, _ = _global_row_mean(exp_avg, vocab_dim)
+        m_bar = mbar_now.norm().item()
+        mbar_target = (1.0 - s) * mbar0.to(mbar_now.device)
+        _subtract_row_mean_(exp_avg, mbar_now - mbar_target, vocab_dim)
+
+    return {
+        "mu_w_pre": mu_w_pre,
+        "mu_w_post": mu_w_post,
+        "m_bar": m_bar,
+        "s": s,
+        "mu_target_norm": mu_target.norm().item(),
+    }
+
+
+@torch.no_grad()
 def centered_geometry(weight, vocab_dim=0, already_centered=False, small_pcts=(1, 5, 10)):
     """CENTERED head-geometry health metrics (Item B). The canonical head-health
     metrics after row-centering: raw ||W|| is gauge-contaminated, so we report the
