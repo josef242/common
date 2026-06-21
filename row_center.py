@@ -162,3 +162,57 @@ def row_center_head_(weight, exp_avg=None, vocab_dim=0):
         "proj_fro": proj_fro,
         "proj_ratio": (proj_fro / w_fro) if w_fro > 0 else 0.0,
     }
+
+
+@torch.no_grad()
+def centered_geometry(weight, vocab_dim=0, already_centered=False, small_pcts=(1, 5, 10)):
+    """CENTERED head-geometry health metrics (Item B). The canonical head-health
+    metrics after row-centering: raw ||W|| is gauge-contaminated, so we report the
+    centered-head spectrum. Rising spectral_concentration + eroding small singular
+    values is the dn1-collapse death signature (spec_conc_c 0.26->0.48 as it died),
+    so this doubles as a permanent degeneration early-warning.
+
+    Cheap: instead of SVD-ing the [V,D]=[32k,2560] head, form the gram
+    G = W_c^T W_c ([D,D], small) and eigendecompose it. Eigenvalues of G are
+    sigma_i(W_c)^2. Under sharding, G = sum_shards W_c_local^T W_c_local
+    (all-reduced over the head's device mesh), then a local eigh on [D,D].
+
+    already_centered: True when the stored weight is row-centered every step (the
+    in-loop case) -> G = W^T W directly. False for offline probing of an
+    uncentered checkpoint -> subtract the global row-mean first.
+
+    Returns: Wc_fro, s1_c (=sigma_1(W_c)), spectral_concentration_c
+    (= s1_c^2 / ||W_c||_F^2), effective_rank_c (participation ratio
+    (sum lambda)^2 / sum lambda^2), and small_sigma_pN percentiles of the ascending
+    singular values."""
+    is_dt = isinstance(weight, DTensor)
+    local = weight._local_tensor if is_dt else weight
+    if vocab_dim != 0:
+        local = local.transpose(0, vocab_dim)
+    Wl = local.float()                                   # [v_local, D]
+    if not already_centered:
+        mu, _ = _global_row_mean(weight, vocab_dim)      # global mu [D]
+        Wl = Wl - mu.to(Wl.device).unsqueeze(0)
+    G = Wl.t() @ Wl                                       # [D, D] local partial gram
+    if is_dt and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(G, op=dist.ReduceOp.SUM, group=weight.device_mesh.get_group())
+    # symmetric PSD -> eigh; clamp tiny negatives from roundoff.
+    evals = torch.linalg.eigvalsh(G).clamp_min(0.0)      # ascending, lambda_i = sigma_i^2
+    total = evals.sum()
+    sig = evals.sqrt()                                    # ascending singular values
+    s1_c = sig[-1].item()
+    Wc_fro = total.sqrt().item()
+    spec_conc_c = (evals[-1] / total).item() if total > 0 else 0.0
+    eff_rank = ((total * total) / (evals * evals).sum()).item() if total > 0 else 0.0
+    D = sig.numel()
+    small = {}
+    for p in small_pcts:
+        k = max(0, min(D - 1, int(round((p / 100.0) * (D - 1)))))
+        small[f"small_sigma_p{p}"] = sig[k].item()       # p-th percentile (ascending)
+    return {
+        "Wc_fro": Wc_fro,
+        "s1_c": s1_c,
+        "spectral_concentration_c": spec_conc_c,
+        "effective_rank_c": eff_rank,
+        **small,
+    }

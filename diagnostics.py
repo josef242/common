@@ -761,7 +761,7 @@ class LayerDiagnostics:
                          filename: str = "diagnostics.jsonl",
                          awd_data: dict = None, moe_data: dict = None,
                          activation_data: dict = None, zloss_data: dict = None,
-                         rc_data: dict = None):
+                         rc_data: dict = None, cg_data: dict = None):
         """
         Compute diagnostics and write to JSONL file.
         Only rank 0 writes to the file.
@@ -831,6 +831,13 @@ class LayerDiagnostics:
             # gauge's relative size in the head.
             if rc_data is not None:
                 data['row_center'] = rc_data
+
+            # Include centered head-geometry health metrics when provided (Item B):
+            # the canonical post-row-centering head-health series (||W_c||, s1_c,
+            # spectral_concentration_c, effective_rank_c, small-sigma percentiles)
+            # and the dn1-collapse early-warning. val-cadence snapshot.
+            if cg_data is not None:
+                data['centered_geom'] = cg_data
 
             # Merge forward-activation RMS profile when provided.
             if activation_data is not None:
