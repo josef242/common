@@ -227,7 +227,7 @@ def row_center_head_warmup_(weight, s, mu0, exp_avg=None, mbar0=None, vocab_dim=
 
 
 @torch.no_grad()
-def centered_geometry(weight, vocab_dim=0, already_centered=False, small_pcts=(1, 5, 10)):
+def centered_geometry(weight, vocab_dim=0, already_centered=None, small_pcts=(1, 5, 10)):
     """CENTERED head-geometry health metrics (Item B). The canonical head-health
     metrics after row-centering: raw ||W|| is gauge-contaminated, so we report the
     centered-head spectrum. Rising spectral_concentration + eroding small singular
@@ -239,9 +239,19 @@ def centered_geometry(weight, vocab_dim=0, already_centered=False, small_pcts=(1
     sigma_i(W_c)^2. Under sharding, G = sum_shards W_c_local^T W_c_local
     (all-reduced over the head's device mesh), then a local eigh on [D,D].
 
-    already_centered: True when the stored weight is row-centered every step (the
-    in-loop case) -> G = W^T W directly. False for offline probing of an
-    uncentered checkpoint -> subtract the global row-mean first.
+    ALWAYS subtracts the CURRENT full row-mean (mu_now = mean_vocab(stored W))
+    before forming the gram — measure what's actually in the tensor (Nexus #163).
+    This is strictly correct everywhere: in steady-state the stored weight is
+    already centered so mu_now ~= 0 and the subtraction is a no-op (metric
+    unchanged from before); DURING A WARMUP RAMP the stored weight still carries a
+    residual gauge ((1-s)*mu0) and subtracting mu_now recovers the TRUE centered
+    geometry instead of an artifact. The old `already_centered=True` path skipped
+    this subtraction and, when fed a mid-ramp (partially-centered) weight, reported
+    the residual common-mode mode as a fake rank-~1.6 collapse (eff_rank=1.59,
+    spec_conc=0.79 vs the true ~8 / ~0.32). No ramp branch — just always subtract.
+
+    `already_centered` is accepted-but-ignored for back-compat (the subtraction is
+    a no-op when the weight is genuinely centered, so passing True is harmless).
 
     Returns: Wc_fro, s1_c (=sigma_1(W_c)), spectral_concentration_c
     (= s1_c^2 / ||W_c||_F^2), effective_rank_c (participation ratio
@@ -252,9 +262,9 @@ def centered_geometry(weight, vocab_dim=0, already_centered=False, small_pcts=(1
     if vocab_dim != 0:
         local = local.transpose(0, vocab_dim)
     Wl = local.float()                                   # [v_local, D]
-    if not already_centered:
-        mu, _ = _global_row_mean(weight, vocab_dim)      # global mu [D]
-        Wl = Wl - mu.to(Wl.device).unsqueeze(0)
+    # ALWAYS subtract the current global row-mean (see docstring / Nexus #163).
+    mu, _ = _global_row_mean(weight, vocab_dim)          # global CURRENT mu [D]
+    Wl = Wl - mu.to(Wl.device).unsqueeze(0)
     G = Wl.t() @ Wl                                       # [D, D] local partial gram
     if is_dt and dist.is_available() and dist.is_initialized():
         dist.all_reduce(G, op=dist.ReduceOp.SUM, group=weight.device_mesh.get_group())
