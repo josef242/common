@@ -59,7 +59,17 @@ except Exception:
 
 @torch._dynamo.disable
 def cce_loss(hidden, weight, targets, **kwargs):
-    """Thin wrapper so CCE executes in eager mode."""
+    """Thin wrapper so CCE executes in eager mode.
+
+    PROBE HOOK (env WD_CCE_IMPL): override the CCE implementation. The default fused
+    'cce' (impl=1) Triton kernel REQUIRES bf16/fp16 weights — so a full fp32-param
+    forward (the decisive sharded-path test) is impossible with it. Setting
+    WD_CCE_IMPL=torch_compile selects the pure-PyTorch impl which accepts fp32,
+    enabling the fp32-everywhere run. Unset => byte-identical to baseline. One env
+    read per call is negligible at the head. (Josef's unblock for the fp32 test.)"""
+    _impl = os.environ.get('WD_CCE_IMPL')
+    if _impl and 'impl' not in kwargs:
+        kwargs = dict(kwargs, impl=_impl)
     return linear_cross_entropy(hidden, weight, targets, **kwargs)
 
 

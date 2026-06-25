@@ -9,7 +9,7 @@ import math
 from typing import Protocol
 import torch
 from torch.distributed.tensor import DTensor
-from torch.distributed import gather, scatter, broadcast
+from torch.distributed import gather, scatter, broadcast, all_reduce
 from collections import deque
 
 __version__ = "0.5.0"  # Configurable 16-bit Adam states
@@ -365,6 +365,40 @@ class Fsdp1dWork:
             update = apply_normuon(update, self.state["second_momentum_buffer"], self.group["beta2"])
 
         # =========================================================================
+        # TANGENT PROJECTION (opt-in) — strip the radial component of the FINAL update
+        # =========================================================================
+        # Newton-Schulz's singular-value flattening turns the (radial-null) CE gradient into
+        # an update with a small but 100%-consistent ANTI-radial component (cos(update,W)≈-0.013),
+        # which descent flips to +radial -> body ‖W‖ grows -> WD-starvation. Project it out:
+        #   U ← U − W·⟨U,W⟩/‖W‖²   (GLOBAL coefficient, all-reduced over the FSDP shards).
+        # Done AFTER NS+scale+normuon (normuon's per-neuron rescale is not Frobenius-orthogonal,
+        # so projecting earlier would let it reintroduce radial — Math Agent). Body matrices only;
+        # gate via param group 'tangent_project'. Optional global norm-preserving rescale.
+        if self.group.get("tangent_project", False):
+            _u_loc = update.to_local() if hasattr(update, "to_local") else update
+            _w_loc = self.param.to_local() if hasattr(self.param, "to_local") else self.param
+            _uf = _u_loc.reshape(-1).float()
+            _wf = _w_loc.reshape(-1).float()
+            _stats = torch.stack([(_uf * _wf).sum(), (_wf * _wf).sum()])  # [<U,W>_local, ‖W‖²_local]
+            all_reduce(_stats, group=pg)                                  # global sums over shards
+            _dot, _wsq = _stats[0].item(), _stats[1].item()
+            if _wsq > 0:
+                _c = _dot / _wsq
+                if self.group.get("tangent_project_preserve_norm", False):
+                    _n0 = _stats_norm = None
+                    _un_loc = torch.stack([(_uf * _uf).sum()])
+                    all_reduce(_un_loc, group=pg)
+                    _norm_before = _un_loc[0].clamp_min(0).sqrt().item()
+                # U ← U − c·W  (per-shard, with the global c)
+                _u_loc.add_(_w_loc.to(_u_loc.dtype), alpha=-_c)
+                if self.group.get("tangent_project_preserve_norm", False) and _norm_before > 0:
+                    _un2 = torch.stack([(_u_loc.reshape(-1).float() ** 2).sum()])
+                    all_reduce(_un2, group=pg)
+                    _norm_after = _un2[0].clamp_min(0).sqrt().item()
+                    if _norm_after > 0:
+                        _u_loc.mul_(_norm_before / _norm_after)
+
+        # =========================================================================
         # Weight Decay and Update Application
         # =========================================================================
         if use_muonsphere:
@@ -534,10 +568,14 @@ class Muon(torch.optim.Optimizer):
                 group["use_muonsphere"] = group.get("use_muonsphere", False)
                 group["radius_scale"] = group.get("radius_scale", 2.0)  # c parameter: R = c × √(d_out/d_in)
                 group["power_iters"] = group.get("power_iters", 10)     # Power iteration steps for spectral norm
+                # Tangent projection: strip the radial component of the final Muon update vs W
+                group["tangent_project"] = group.get("tangent_project", False)
+                group["tangent_project_preserve_norm"] = group.get("tangent_project_preserve_norm", False)
                 required_keys = {
                     "params", "lr", "momentum", "weight_decay", "use_muon", "rms_scale",
                     "nesterov", "ns_steps", "use_normuon", "beta2", "cautious_weight_decay",
-                    "use_muonsphere", "radius_scale", "power_iters"  # MuonSphere keys
+                    "use_muonsphere", "radius_scale", "power_iters",  # MuonSphere keys
+                    "tangent_project", "tangent_project_preserve_norm"  # tangent projection keys
                 }
                 assert required_keys <= set(group.keys()), f"Muon group missing keys: {required_keys - set(group.keys())}"
             else:
