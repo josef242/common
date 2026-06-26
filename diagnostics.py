@@ -62,6 +62,14 @@ class LayerStats:
     shared_experts: Optional[BlockStats] = None      # shared expert params only
     gate: Optional[BlockStats] = None                # router gate weight
     expert_spread: Optional[Dict[str, float]] = None # {w_min, w_max, w_std, g_min, g_max, g_std}
+    # Subgroup splits (kv3 FFN-controller / QK-norm investigation). All optional, None unless
+    # the diagnostics tracker fills them. attn_qk vs attn_vo tests whether attention is quiet
+    # only because QK-norm makes wq/wk forward-scale-invariant; ffn_w1w3 vs ffn_w2 tells whether
+    # to eventually control SwiGLU in-proj only, w2 only, or all FFN. See docs/KV3_CONTROLLER_DESIGN.md.
+    attn_qk: Optional[BlockStats] = None             # wq/wk (QK-norm scale-invariant)
+    attn_vo: Optional[BlockStats] = None             # wv/wo (NOT QK-normed)
+    ffn_w1w3: Optional[BlockStats] = None            # SwiGLU in-proj (gate+up, dim->inner)
+    ffn_w2: Optional[BlockStats] = None              # SwiGLU down-proj (inner->dim)
 
 
 @dataclass
@@ -91,18 +99,23 @@ class LayerDiagnostics:
     shared embedding weight. Track the ratio trend over time.
     """
 
-    def __init__(self, model, ddp_rank: int, ddp_world_size: int, ddp: bool = True):
+    def __init__(self, model, ddp_rank: int, ddp_world_size: int, ddp: bool = True,
+                 track_subgroups: bool = False):
         """
         Args:
             model: The FSDP-wrapped model (or compiled model wrapping FSDP)
             ddp_rank: This process's rank
             ddp_world_size: Total number of processes
             ddp: Whether we're in distributed mode
+            track_subgroups: also track wq/wk-vs-wv/wo and w1/w3-vs-w2 pdr subgroups (kv3
+                QK-norm investigation). Opt-in: roughly doubles the transient snapshot VRAM
+                at diagnostic cadence, so off by default.
         """
         self.model = model
         self.ddp_rank = ddp_rank
         self.ddp_world_size = ddp_world_size
         self.ddp = ddp
+        self._track_subgroups = track_subgroups
 
         # Stashed gradient norms from last backward pass
         # Values are float (scalar norm²) or list[float] (per-expert norm²)
@@ -207,6 +220,46 @@ class LayerDiagnostics:
             return params
         ff = layer.feed_forward
         return [ff.w1.weight, ff.w2.weight, ff.w3.weight]
+
+    # --- Subgroup param lists (kv3 FFN-controller / QK-norm investigation) ---
+    # Strict subsets of the attn/ffn aggregate blocks above (GDN small params / norms are
+    # excluded — they belong to neither subgroup). Used to log per-subgroup pdr.
+    def _get_attn_qk_params(self, layer) -> List[torch.nn.Parameter]:
+        """Q/K projections only (forward scale-invariant under QK-norm)."""
+        if getattr(layer, 'use_gdn', False):
+            gdn = layer.gdn_attn
+            return [gdn.q_proj.weight, gdn.k_proj.weight]
+        attn = layer.attention
+        return [attn.wq.weight, attn.wk.weight]
+
+    def _get_attn_vo_params(self, layer) -> List[torch.nn.Parameter]:
+        """V/O projections only (NOT covered by QK-norm)."""
+        if getattr(layer, 'use_gdn', False):
+            gdn = layer.gdn_attn
+            return [gdn.v_proj.weight, gdn.o_proj.weight]
+        attn = layer.attention
+        return [attn.wv.weight, attn.wo.weight]
+
+    def _get_ffn_w1w3_params(self, layer) -> List[torch.nn.Parameter]:
+        """SwiGLU in-projections w1 (gate) + w3 (up), dim->inner_dim."""
+        if getattr(layer, 'moe_enabled', False):
+            params = [layer.moe.experts.w1, layer.moe.experts.w3]
+            if layer.moe.shared_experts is not None:
+                se = layer.moe.shared_experts
+                params.extend([se.w1.weight, se.w3.weight])
+            return params
+        ff = layer.feed_forward
+        return [ff.w1.weight, ff.w3.weight]
+
+    def _get_ffn_w2_params(self, layer) -> List[torch.nn.Parameter]:
+        """SwiGLU down-projection w2, inner_dim->dim."""
+        if getattr(layer, 'moe_enabled', False):
+            params = [layer.moe.experts.w2]
+            if layer.moe.shared_experts is not None:
+                params.append(layer.moe.shared_experts.w2.weight)
+            return params
+        ff = layer.feed_forward
+        return [ff.w2.weight]
 
     def _get_expert_params(self, layer) -> List[torch.nn.Parameter]:
         """Get expert 3D params (w1/w2/w3) for a MoE layer."""
@@ -483,6 +536,15 @@ class LayerDiagnostics:
                 g_sq = self._compute_block_norm_squared(ffn_params, use_grad=True)
                 self._grad_norms[f'layer_{i}_ffn'] = g_sq.item()
 
+                # Subgroup splits (kv3): wq/wk vs wv/wo, w1/w3 vs w2 (opt-in)
+                if self._track_subgroups:
+                    for _sg, _fn in (('attn_qk', self._get_attn_qk_params),
+                                     ('attn_vo', self._get_attn_vo_params),
+                                     ('ffn_w1w3', self._get_ffn_w1w3_params),
+                                     ('ffn_w2', self._get_ffn_w2_params)):
+                        self._grad_norms[f'layer_{i}_{_sg}'] = \
+                            self._compute_block_norm_squared(_fn(layer), use_grad=True).item()
+
                 # MoE component breakdown
                 if getattr(layer, 'moe_enabled', False):
                     # Expert params only
@@ -531,6 +593,13 @@ class LayerDiagnostics:
             for i, layer in enumerate(model.layers):
                 self._snapshot_block(f'layer_{i}_attn', self._get_attention_params(layer), device)
                 self._snapshot_block(f'layer_{i}_ffn', self._get_ffn_params(layer), device)
+                # Subgroup splits (kv3, opt-in): capture_updates is key-driven, so these
+                # auto-produce _update_norms[layer_{i}_{attn_qk|attn_vo|ffn_w1w3|ffn_w2}].
+                if self._track_subgroups:
+                    self._snapshot_block(f'layer_{i}_attn_qk', self._get_attn_qk_params(layer), device)
+                    self._snapshot_block(f'layer_{i}_attn_vo', self._get_attn_vo_params(layer), device)
+                    self._snapshot_block(f'layer_{i}_ffn_w1w3', self._get_ffn_w1w3_params(layer), device)
+                    self._snapshot_block(f'layer_{i}_ffn_w2', self._get_ffn_w2_params(layer), device)
 
     def _snapshot_block(self, key: str, params: List[torch.nn.Parameter], device: str):
         """Clone param data and record local w_norm² + global numel for a single block."""
@@ -659,6 +728,17 @@ class LayerDiagnostics:
                 ffn_g_sq = torch.tensor(self._grad_norms.get(f'layer_{i}_ffn', 0.0), device=device)
                 ffn_stats = self._compute_block_stats(ffn_params, ffn_g_sq)
 
+                # Subgroup splits (kv3, opt-in): wq/wk vs wv/wo, w1/w3 vs w2
+                attn_qk_stats = attn_vo_stats = ffn_w1w3_stats = ffn_w2_stats = None
+                if self._track_subgroups:
+                    def _sg_stats(_sg, _params, _i=i):   # bind i at def-time (not a late closure)
+                        _g = torch.tensor(self._grad_norms.get(f'layer_{_i}_{_sg}', 0.0), device=device)
+                        return self._compute_block_stats(_params, _g)
+                    attn_qk_stats = _sg_stats('attn_qk', self._get_attn_qk_params(layer))
+                    attn_vo_stats = _sg_stats('attn_vo', self._get_attn_vo_params(layer))
+                    ffn_w1w3_stats = _sg_stats('ffn_w1w3', self._get_ffn_w1w3_params(layer))
+                    ffn_w2_stats = _sg_stats('ffn_w2', self._get_ffn_w2_params(layer))
+
                 # MoE component breakdown
                 moe_enabled = getattr(layer, 'moe_enabled', False)
                 expert_stats = None
@@ -694,6 +774,8 @@ class LayerDiagnostics:
                     moe_enabled=moe_enabled, experts=expert_stats,
                     shared_experts=shared_stats, gate=gate_stats,
                     expert_spread=expert_spread,
+                    attn_qk=attn_qk_stats, attn_vo=attn_vo_stats,
+                    ffn_w1w3=ffn_w1w3_stats, ffn_w2=ffn_w2_stats,
                 ))
 
         snapshot = DiagnosticsSnapshot(
@@ -734,6 +816,11 @@ class LayerDiagnostics:
         for ls in snapshot.layers:
             _apply(ls.attn, f'layer_{ls.idx}_attn')
             _apply(ls.ffn, f'layer_{ls.idx}_ffn')
+            # Subgroup splits (kv3): param_delta_ratio for wq/wk, wv/wo, w1/w3, w2
+            _apply(ls.attn_qk, f'layer_{ls.idx}_attn_qk')
+            _apply(ls.attn_vo, f'layer_{ls.idx}_attn_vo')
+            _apply(ls.ffn_w1w3, f'layer_{ls.idx}_ffn_w1w3')
+            _apply(ls.ffn_w2, f'layer_{ls.idx}_ffn_w2')
 
     @staticmethod
     def _block_to_dict(bs: BlockStats) -> dict:
@@ -745,6 +832,11 @@ class LayerDiagnostics:
         """Convert a LayerStats to a JSON-serializable dict with optional MoE fields."""
         bd = LayerDiagnostics._block_to_dict
         d = {'idx': ls.idx, 'attn': bd(ls.attn), 'ffn': bd(ls.ffn)}
+        # Subgroup splits (kv3): emit when present (None unless the tracker filled them)
+        for _name, _bs in (('attn_qk', ls.attn_qk), ('attn_vo', ls.attn_vo),
+                           ('ffn_w1w3', ls.ffn_w1w3), ('ffn_w2', ls.ffn_w2)):
+            if _bs is not None:
+                d[_name] = bd(_bs)
         if ls.moe_enabled:
             d['moe_enabled'] = True
             if ls.experts is not None:
@@ -956,6 +1048,17 @@ class LayerDiagnostics:
                     log(f"    ffn update:    min={min(ffn_updates):.6f} "
                         f"max={max(ffn_updates):.6f} "
                         f"mean={_mean(ffn_updates):.6f}")
+
+            # Subgroup pdr (kv3 QK-norm / FFN-split investigation) — only when tracked, so kv2
+            # and other runs' stdout is unchanged. One line with the four subgroup medians.
+            if snapshot.layers and snapshot.layers[0].ffn_w1w3 is not None:
+                def _sg_med(field):
+                    vals = sorted(getattr(l, field).param_delta_ratio for l in snapshot.layers
+                                  if getattr(l, field) is not None
+                                  and getattr(l, field).param_delta_ratio is not None)
+                    return vals[len(vals) // 2] if vals else float('nan')
+                log(f"    [subgroup pdr] attn qk={_sg_med('attn_qk'):.3e} vo={_sg_med('attn_vo'):.3e}"
+                    f" | ffn w1w3={_sg_med('ffn_w1w3'):.3e} w2={_sg_med('ffn_w2'):.3e}")
 
             # MoE components
             if moe_layers:
