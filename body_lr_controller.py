@@ -152,6 +152,11 @@ class BodyLRController:
             _xs = [k[0] for k in _kn]
             if any(b <= a for a, b in zip(_xs, _xs[1:])):
                 raise ValueError(f"ffn_pdr_controller.reference.{_name} x must be strictly ascending: {_xs}")
+            # y (pdr target) must be strictly positive: r feeds m_ff=r/K_ema and e=log(r/pdr_ema);
+            # a zero/negative knot would make log(r/…) raise or go -inf.
+            if any(k[1] <= 0 for k in _kn):
+                raise ValueError(f"ffn_pdr_controller.reference.{_name} y (pdr) must be > 0: "
+                                 f"{[k[1] for k in _kn]}")
         # PI trim (off in run 1)
         self.pid = PIDController(kp=float(cfg.get("kp", 0.0)), ki=float(cfg.get("ki", 0.0)),
                                  kd=float(cfg.get("kd", 0.0)),
@@ -198,8 +203,9 @@ class BodyLRController:
         # run with no recovery. Reject and hold the last good m instead.
         if pdr_ffn is None or not math.isfinite(pdr_ffn) or pdr_ffn <= 0.0:
             self._dropped += 1
-            if self._last:
-                self._last = dict(self._last, stale=True, dropped=self._dropped)
+            # Reached only AFTER the warmup gate, so clear any leftover gated flag (else
+            # log_line would mislabel an engaged-but-dropped controller as "warmup-gated").
+            self._last = dict(self._last, gated=False, stale=True, dropped=self._dropped)
             return self.m
         self._dropped = 0
         r = self.reference(tok_m)
@@ -253,13 +259,19 @@ class BodyLRController:
         if not self.enabled:
             return ""
         d = self._last
-        if not d:
-            # No observe yet. Distinguish a fresh warmup start from a resume that restored a
-            # non-unity m but hasn't re-observed (don't mislabel an engaged controller "gated").
-            tag = "warmup-gated" if self.m >= 1.0 - 1e-9 else "resumed, pre-observe"
+        if not d or 'pdr' not in d or d.get('gated'):
+            # No successful observe to report yet. Distinguish: a fresh warmup start; a resume
+            # that restored a non-unity m but hasn't re-observed; or dropped samples before the
+            # first good one. (Don't mislabel an engaged controller "warmup-gated".)
+            if d.get('gated'):
+                tag = "warmup-gated"
+            elif d.get('stale'):
+                tag = f"no valid pdr yet, dropped×{d.get('dropped', 0)}"
+            elif self.m >= 1.0 - 1e-9:
+                tag = "warmup-gated"
+            else:
+                tag = "resumed, pre-observe"
             return f"  [ffn-ctrl] m={self.current_multiplier():.3f} ({tag})"
-        if d.get("gated"):
-            return f"  [ffn-ctrl] m={self.current_multiplier():.3f} (warmup-gated)"
         flags = ("" if not self.alarm else " ALARM:base-LR-too-high") + \
                 ("" if not self.inspect else " inspect:low-m-early") + \
                 ("" if not d.get("stale") else f" STALE:pdr-dropped×{d.get('dropped', 0)}")
@@ -270,7 +282,7 @@ class BodyLRController:
     def state_dict(self) -> Dict[str, Any]:
         return {"version": _STATE_VERSION, "m": self.m, "logK": self._logK,
                 "pdr_ema": self._pdr_ema, "alarm_run": self._alarm_run,
-                "alarm": self.alarm, "alarm_ever": self.alarm_ever,
+                "alarm": self.alarm, "alarm_ever": self.alarm_ever, "inspect": self.inspect,
                 "dropped": self._dropped, "pid": self.pid.state_dict()}
 
     def load_state_dict(self, sd: Dict[str, Any]):
@@ -286,6 +298,7 @@ class BodyLRController:
         self._alarm_run = sd.get("alarm_run", 0)
         self.alarm = sd.get("alarm", False)
         self.alarm_ever = sd.get("alarm_ever", self.alarm)
+        self.inspect = sd.get("inspect", False)
         self._dropped = sd.get("dropped", 0)
         if "pid" in sd:
             self.pid.load_state_dict(sd["pid"])
