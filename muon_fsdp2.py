@@ -383,7 +383,13 @@ class Fsdp1dWork:
             all_reduce(_stats, group=pg)                                  # global sums over shards
             _dot, _wsq = _stats[0].item(), _stats[1].item()
             if _wsq > 0:
-                _c = _dot / _wsq
+                # Partial-projection strength f in [0,1] (default 1.0): remove only fraction f of
+                # the radial component, so ‖W‖ grows at (1-f) of its natural rate. f=1 = full
+                # projection (flat ‖W‖, the original behavior); f=0 = no projection (free growth).
+                # Updated per-step by the train loop when a schedule is configured. See
+                # docs / configs tangent_project_strength.
+                _strength = self.group.get("tangent_project_strength", 1.0)
+                _c = (_dot / _wsq) * _strength
                 if self.group.get("tangent_project_preserve_norm", False):
                     _n0 = _stats_norm = None
                     _un_loc = torch.stack([(_uf * _uf).sum()])
@@ -571,11 +577,15 @@ class Muon(torch.optim.Optimizer):
                 # Tangent projection: strip the radial component of the final Muon update vs W
                 group["tangent_project"] = group.get("tangent_project", False)
                 group["tangent_project_preserve_norm"] = group.get("tangent_project_preserve_norm", False)
+                # Partial-projection strength f (default 1.0 = full projection). The train loop
+                # may overwrite this per-step from a schedule; the default keeps existing configs
+                # bit-identical (f=1.0).
+                group["tangent_project_strength"] = group.get("tangent_project_strength", 1.0)
                 required_keys = {
                     "params", "lr", "momentum", "weight_decay", "use_muon", "rms_scale",
                     "nesterov", "ns_steps", "use_normuon", "beta2", "cautious_weight_decay",
                     "use_muonsphere", "radius_scale", "power_iters",  # MuonSphere keys
-                    "tangent_project", "tangent_project_preserve_norm"  # tangent projection keys
+                    "tangent_project", "tangent_project_preserve_norm", "tangent_project_strength"
                 }
                 assert required_keys <= set(group.keys()), f"Muon group missing keys: {required_keys - set(group.keys())}"
             else:
