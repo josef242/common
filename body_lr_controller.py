@@ -128,35 +128,47 @@ class BodyLRController:
         self.pdr_alpha: float = float(cfg.get("pdr_ema_alpha", 0.15))
         self.rate_down: float = float(cfg.get("rate_down", 0.05))
         self.rate_up: float = float(cfg.get("rate_up", 0.02))
-        # reference (smooth dn2_merge)
+        # --- reference pdr curve(s) ---
+        # The reference is a single `knots` curve (token-in-M -> target ffn-median pdr). OPTIONALLY,
+        # a run that needs an early-regime target distinct from the mature glide (e.g. a from-scratch
+        # run riding a high early-plasticity pdr before settling onto a measured glide) can supply
+        # `blend_from`: a second knot curve that is smoothstep-crossfaded INTO `knots` over
+        # [start_tok_m, end_tok_m]. With no `blend_from`, reference() is simply interp(knots) — the
+        # common case. Fields are named by ROLE; the provenance of any given curve (which experiment
+        # it was measured from) belongs in the config's comments, not the schema.
         ref = cfg.get("reference", {}) or {}
-        self.merge_t0: float = float(ref.get("merge_start_tok_m", 197.0))
-        self.merge_t1: float = float(ref.get("merge_end_tok_m", 575.0))
-        self.kv2_early_knots = [tuple(k) for k in ref.get(
-            "kv2_early_knots", [[197, 3.42e-3], [400, 3.10e-3], [600, 2.90e-3]])]
-        # DN2's ACTUAL recorded FFN-median pdr, sampled out to the full run horizon (~26B tok).
-        # Past the last knot _interp flat-extrapolates at DN2's late plateau (~1.26e-3) — DN2's
-        # own data flattened there, so this is faithful. (Earlier the curve stopped at 1000M and
-        # flat-lined at 2.20e-3 for ~97% of the run — a design-fidelity bug the 850M sim missed.)
-        self.dn2_ffn_knots = [tuple(k) for k in ref.get(
-            "dn2_ffn_knots", [[197, 1.66e-3], [393, 2.94e-3], [590, 2.58e-3], [787, 2.28e-3],
-                              [1000, 2.20e-3], [2000, 1.85e-3], [4000, 1.64e-3], [8000, 1.38e-3],
-                              [12000, 1.30e-3], [16000, 1.28e-3], [20000, 1.23e-3],
-                              [26000, 1.26e-3]])]
-        # Validate knot lists: non-empty and strictly ascending in x (else _interp silently
-        # mis-extrapolates / returns NaN). Cheap guard against a future edited config.
-        for _name, _kn in (("kv2_early_knots", self.kv2_early_knots),
-                           ("dn2_ffn_knots", self.dn2_ffn_knots)):
+        self.knots = [tuple(k) for k in ref.get("knots", [])]
+        _bf = ref.get("blend_from") or None
+        if _bf:
+            self.blend_knots: Optional[list] = [tuple(k) for k in _bf.get("knots", [])]
+            self.blend_t0: Optional[float] = float(_bf["start_tok_m"])
+            self.blend_t1: Optional[float] = float(_bf["end_tok_m"])
+        else:
+            self.blend_knots = None
+            self.blend_t0 = None
+            self.blend_t1 = None
+        # Validate knot lists: non-empty (when enabled) + strictly ascending in x (else _interp
+        # silently mis-extrapolates / returns NaN) + strictly positive y (r feeds m_ff=r/K_ema and
+        # e=log(r/pdr_ema); a zero/negative knot would make log(r/…) raise or go -inf). Cheap guard
+        # against a future edited config.
+        _lists = [("knots", self.knots)]
+        if self.blend_knots is not None:
+            _lists.append(("blend_from.knots", self.blend_knots))
+        for _name, _kn in _lists:
             if not _kn:
+                if _name == "knots" and not self.enabled:
+                    continue        # disabled controller never calls reference(); no curve needed
                 raise ValueError(f"ffn_pdr_controller.reference.{_name} is empty")
             _xs = [k[0] for k in _kn]
             if any(b <= a for a, b in zip(_xs, _xs[1:])):
                 raise ValueError(f"ffn_pdr_controller.reference.{_name} x must be strictly ascending: {_xs}")
-            # y (pdr target) must be strictly positive: r feeds m_ff=r/K_ema and e=log(r/pdr_ema);
-            # a zero/negative knot would make log(r/…) raise or go -inf.
             if any(k[1] <= 0 for k in _kn):
                 raise ValueError(f"ffn_pdr_controller.reference.{_name} y (pdr) must be > 0: "
                                  f"{[k[1] for k in _kn]}")
+        # blend window must be a real interval (else the smoothstep degenerates to a hard step).
+        if self.blend_knots is not None and self.blend_t0 >= self.blend_t1:
+            raise ValueError("ffn_pdr_controller.reference.blend_from.start_tok_m must be < end_tok_m "
+                             f"(got {self.blend_t0} >= {self.blend_t1})")
         # PI trim (off in run 1)
         self.pid = PIDController(kp=float(cfg.get("kp", 0.0)), ki=float(cfg.get("ki", 0.0)),
                                  kd=float(cfg.get("kd", 0.0)),
@@ -179,9 +191,10 @@ class BodyLRController:
 
     # ---- reference ----
     def reference(self, tok_m: float) -> float:
-        a = _smoothstep(tok_m, self.merge_t0, self.merge_t1)
-        return (1.0 - a) * _interp(self.kv2_early_knots, tok_m) \
-            + a * _interp(self.dn2_ffn_knots, tok_m)
+        if self.blend_knots is None:
+            return _interp(self.knots, tok_m)
+        a = _smoothstep(tok_m, self.blend_t0, self.blend_t1)
+        return (1.0 - a) * _interp(self.blend_knots, tok_m) + a * _interp(self.knots, tok_m)
 
     # ---- actuator value (held; written every step by the loop) ----
     def current_multiplier(self) -> float:
@@ -237,7 +250,10 @@ class BodyLRController:
         # guardrails. `alarm` reflects the CURRENT state (out of authority right now), not a
         # latch — so it clears when the condition clears, avoiding permanent log spam / fatigue.
         # `alarm_ever` keeps the historical record. Both are checkpointed.
-        self.inspect = (self.m < self.authority_low_m and tok_m < self.merge_t1)
+        # `inspect`: m fell below the authority floor while still inside the early blend region.
+        # With no blend_from there is no early region, so this never fires.
+        _blend_until = self.blend_t1 if self.blend_t1 is not None else float("-inf")
+        self.inspect = (self.m < self.authority_low_m and tok_m < _blend_until)
         if self.m <= self.m_floor + 1e-9 and pdr_ffn > self.alarm_pdr_ratio * r:
             self._alarm_run += 1
         else:
