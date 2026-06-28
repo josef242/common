@@ -263,7 +263,7 @@ def centered_geometry(weight, vocab_dim=0, already_centered=None, small_pcts=(1,
         local = local.transpose(0, vocab_dim)
     Wl = local.float()                                   # [v_local, D]
     # ALWAYS subtract the current global row-mean (see docstring / Nexus #163).
-    mu, _ = _global_row_mean(weight, vocab_dim)          # global CURRENT mu [D]
+    mu, V = _global_row_mean(weight, vocab_dim)          # global CURRENT mu [D], global vocab count
     Wl = Wl - mu.to(Wl.device).unsqueeze(0)
     G = Wl.t() @ Wl                                       # [D, D] local partial gram
     if is_dt and dist.is_available() and dist.is_initialized():
@@ -281,10 +281,19 @@ def centered_geometry(weight, vocab_dim=0, already_centered=None, small_pcts=(1,
     for p in small_pcts:
         k = max(0, min(D - 1, int(round((p / 100.0) * (D - 1)))))
         small[f"small_sigma_p{p}"] = sig[k].item()       # p-th percentile (ascending)
+    # CE-invisible gauge metrics. The centered metrics above are gauge-INVARIANT (they subtract the
+    # current row-mean), so under head-gauge hygiene they MATCH across an A/B -- the gauge must be
+    # surfaced separately to SEE it accumulate. mu_w_norm = ||mu(W)||; gauge_frac = ||1 mu^T||_F/||W||_F
+    # (the fraction of the head that is CE-invisible common mode -- ~0.78 in DN2; ~0 under hygiene).
+    mu_w_norm = mu.norm().item()
+    proj_fro = (float(V) ** 0.5) * mu_w_norm
+    w_fro_raw = (Wc_fro * Wc_fro + proj_fro * proj_fro) ** 0.5
     return {
         "Wc_fro": Wc_fro,
         "s1_c": s1_c,
         "spectral_concentration_c": spec_conc_c,
         "effective_rank_c": eff_rank,
+        "mu_w_norm": mu_w_norm,
+        "gauge_frac": (proj_fro / w_fro_raw) if w_fro_raw > 0 else 0.0,
         **small,
     }
