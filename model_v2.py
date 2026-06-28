@@ -171,10 +171,13 @@ def _centered_zloss_deadband(h_flat, weight, tgt_flat, pad_id, tau, fp32_accum):
     centered structure. Returns (loss, logZ_c_mean, h_mu_mean) over non-pad tokens
     (the latter two detached, for telemetry: h_mu flat + logZ_c draining = working).
 
-    Reuses _zloss_optionD's no-[N,V] reconstruction (logZ = ce_none + logit_target).
-    Centering is a catastrophic cancellation at LARGE scale (logZ~O(500) - h.mu~O(400)
-    -> O(100)), so mu, h.mu, and the subtraction are fp32 on top of the fp32_accum
-    CCE-gradient backend (which governs ce_none/logit_target precision)."""
+    Reuses _zloss_optionD's no-[N,V] reconstruction (ce_none = logZ - logit_target). To
+    dodge a catastrophic bf16 cancellation (logit_target ~ h.W_target and h.mu are BOTH
+    gauge-dominated ~O(400)), it forms the CENTERED target logit h.(W_target - mu) DIRECTLY
+    in fp32, so logZ_c = ce_none + h.(W_target - mu) never subtracts two large numbers
+    (fp32_accum still governs ce_none's gradient precision). Note: mu = weight.float().mean(0)
+    materializes a full [V,D] fp32 copy of the head + a dense grad through it -- bounded, but
+    real when Lever 2 is enabled."""
     out_dtype = weight.dtype
     if h_flat.dtype != out_dtype:
         h_flat = h_flat.to(out_dtype)
@@ -182,20 +185,25 @@ def _centered_zloss_deadband(h_flat, weight, tgt_flat, pad_id, tau, fp32_accum):
     kw = dict(reduction="none", ignore_index=pad_id)
     if fp32_accum:
         kw.update(accum_e_fp32=True, accum_c_fp32=True)
-    ce_none = cce_loss(h_flat, weight, tgt_flat, **kw)           # [N]
+    ce_none = cce_loss(h_flat, weight, tgt_flat, **kw)           # [N], = logZ - logit_target
 
     vocab = weight.shape[0]
     valid = tgt_flat != pad_id
     safe_targets = tgt_flat.masked_fill(~valid, 0).clamp_(0, vocab - 1)
     w_rows = weight.index_select(0, safe_targets)               # [N, D] gather (NOT [N, V])
-    logit_target = (h_flat * w_rows).sum(-1)                    # [N]
-    logZ = (ce_none + logit_target).float()                    # = logsumexp per token, fp32
 
-    # Centered: subtract the per-token common-mode offset h.mu (fp32 everywhere).
-    # mu is differentiable through W -> Objective A's zero-gauge-gradient property.
-    mu = weight.float().mean(dim=0)                            # [D]
-    h_mu = h_flat.float() @ mu                                 # [N]
-    logZ_c = logZ - h_mu                                       # [N], fp32, gauge-invariant
+    # logZ_c = logZ - h.mu = ce_none + h.(W_target - mu). Form the CENTERED target logit
+    # h.(W_target - mu) DIRECTLY in fp32. The naive route (logit_target = h.W_target then
+    # logZ_c = logZ - h.mu) subtracts two gauge-dominated ~O(400) quantities, and computing
+    # logit_target's dot in BF16 left an O(0.3-1)/token error that survived the fp32
+    # subtraction and corrupted the deadband threshold near tau (blind review 2026-06-28).
+    # Centering W_target FIRST makes every term small (no large cancellation) and accumulates
+    # in fp32. Gradient is unchanged: d(logZ_c)/dW_i = (p_i - 1/V).h  (Objective A).
+    hf32 = h_flat.float()
+    mu = weight.float().mean(dim=0)                            # [D], global vocab-row mean (the gauge)
+    logit_target_c = (hf32 * (w_rows.float() - mu.unsqueeze(0))).sum(-1)   # [N] = h.(W_target - mu), fp32
+    logZ_c = ce_none.float() + logit_target_c                 # [N], fp32, gauge-invariant
+    h_mu = hf32 @ mu                                          # [N], telemetry only (gauge magnitude)
 
     excess = (logZ_c - float(tau)).clamp_min(0.0)             # relu(logZ_c - tau): the deadband
     keep = valid.to(logZ_c.dtype)

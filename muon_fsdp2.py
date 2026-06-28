@@ -641,9 +641,11 @@ class Muon(torch.optim.Optimizer):
         # in the Adam path is a no-op membership test for every run that doesn't
         # opt in (train_mara fills this with {id(output.weight)} when enabled).
         self.head_gauge_ids = set()
-        self._head_gauge_verify = False          # train loop sets True at val cadence
-        self._last_head_ubar_pre = None          # ||Ubar|| before projection (last head step)
-        self._last_head_ubar_post = None         # ||Ubar|| after  (only when _head_gauge_verify)
+        self._head_gauge_verify = False          # OFF by default. True (tests/debug) also recomputes
+                                                 # the POST-write gauge -> an extra [D] all-reduce per
+                                                 # head step, so left off on the production hot path.
+        self._last_head_ubar_pre = None          # ||Ubar|| removed from the head update (last head step)
+        self._last_head_ubar_post = None         # ||Ubar|| after the write-back (None unless verify)
 
     def _get_work_class(self, p: torch.Tensor) -> tuple[type[Work], int]:
         """
