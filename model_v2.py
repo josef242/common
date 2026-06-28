@@ -155,6 +155,59 @@ def _zloss_optionD(h_flat, weight, tgt_flat, pad_id, fp32_accum):
     return zloss, logz, logz_rms, logz_p95
 
 
+def _centered_zloss_deadband(h_flat, weight, tgt_flat, pad_id, tau, fp32_accum):
+    """DEADBAND CENTERED z-loss (dn4 head-hygiene Lever 2; ships OFF).
+
+    Penalizes the GAUGE-INVARIANT centered log-partition above a ceiling tau:
+
+        logZ_c = logZ - h.mu      (mu = vocab-row mean of the head, a fn of W)
+        loss   = mean_n( relu(logZ_c - tau)^2 )          [alpha applied by trainer]
+
+    This is ZLOSS_CENTERED_PLAN Objective A (gradient flows through mu(W)) with a
+    DEADBAND so it acts as a CEILING, not constant pressure: zero gradient while
+    logZ_c <= tau, Math-approved (DN4_HEAD_HYGIENE_SPEC). Because the loss is a
+    function of the gauge-invariant logZ_c, d(loss)/dW has EXACTLY zero common-mode
+    component (Sum_v(softmax - 1/V) = 0) -- it cannot push the gauge, only the
+    centered structure. Returns (loss, logZ_c_mean, h_mu_mean) over non-pad tokens
+    (the latter two detached, for telemetry: h_mu flat + logZ_c draining = working).
+
+    Reuses _zloss_optionD's no-[N,V] reconstruction (logZ = ce_none + logit_target).
+    Centering is a catastrophic cancellation at LARGE scale (logZ~O(500) - h.mu~O(400)
+    -> O(100)), so mu, h.mu, and the subtraction are fp32 on top of the fp32_accum
+    CCE-gradient backend (which governs ce_none/logit_target precision)."""
+    out_dtype = weight.dtype
+    if h_flat.dtype != out_dtype:
+        h_flat = h_flat.to(out_dtype)
+
+    kw = dict(reduction="none", ignore_index=pad_id)
+    if fp32_accum:
+        kw.update(accum_e_fp32=True, accum_c_fp32=True)
+    ce_none = cce_loss(h_flat, weight, tgt_flat, **kw)           # [N]
+
+    vocab = weight.shape[0]
+    valid = tgt_flat != pad_id
+    safe_targets = tgt_flat.masked_fill(~valid, 0).clamp_(0, vocab - 1)
+    w_rows = weight.index_select(0, safe_targets)               # [N, D] gather (NOT [N, V])
+    logit_target = (h_flat * w_rows).sum(-1)                    # [N]
+    logZ = (ce_none + logit_target).float()                    # = logsumexp per token, fp32
+
+    # Centered: subtract the per-token common-mode offset h.mu (fp32 everywhere).
+    # mu is differentiable through W -> Objective A's zero-gauge-gradient property.
+    mu = weight.float().mean(dim=0)                            # [D]
+    h_mu = h_flat.float() @ mu                                 # [N]
+    logZ_c = logZ - h_mu                                       # [N], fp32, gauge-invariant
+
+    excess = (logZ_c - float(tau)).clamp_min(0.0)             # relu(logZ_c - tau): the deadband
+    keep = valid.to(logZ_c.dtype)
+    denom = keep.sum().clamp_min(1.0)
+    loss = (excess * excess * keep).sum() / denom            # mean( relu(logZ_c - tau)^2 )
+
+    with torch.no_grad():
+        logZ_c_mean = (logZ_c * keep).sum() / denom
+        h_mu_mean = (h_mu * keep).sum() / denom
+    return loss, logZ_c_mean, h_mu_mean
+
+
 # ----------------------------------------------------------------------------
 # Flash Attention (optional)
 # ----------------------------------------------------------------------------
@@ -1466,6 +1519,12 @@ class Transformer(nn.Module):
         self._last_logz = None           # main-head logZ_mean = mean(logZ)
         self._last_logz_rms = None       # main-head logZ rms = sqrt(mean logZ**2)
         self._last_logz_p95 = None       # main-head logZ 95th pctile (tail)
+        # dn4 Lever 2: deadband CENTERED z-loss (target='centered'). 'raw' = today's
+        # mean(logZ**2); 'centered' = mean(relu(logZ_c - tau)**2), gauge-invariant.
+        self._zloss_target = 'raw'       # 'raw' | 'centered'  (trainer sets post-build)
+        self._zloss_tau = 0.0            # deadband ceiling on logZ_c (centered only)
+        self._last_logZ_c = None         # centered log-partition mean (telemetry)
+        self._last_h_mu = None            # common-mode gauge magnitude h.mu mean (telemetry)
         self._last_aux_zloss: dict = {}  # per-aux-head raw zloss
         self._last_aux_logz: dict = {}   # per-aux-head logZ_mean
 
@@ -1902,13 +1961,30 @@ class Transformer(nn.Module):
                     ignore_index=pad_id,
                 )
                 if _want_zloss:
-                    # Option D: no [N,V] materialization. Backend bool selects
-                    # CCE fp32 accumulation in its backward (see _zloss_optionD).
-                    (self._last_zloss, self._last_logz,
-                     self._last_logz_rms, self._last_logz_p95) = _zloss_optionD(
-                        h_flat, self.output.weight, tgt_flat, pad_id,
-                        self._zloss_fp32_accum,
-                    )
+                    if self._zloss_target == 'centered':
+                        # dn4 Lever 2: deadband centered z-loss. Stash into _last_zloss
+                        # so the trainer's alpha*z_sel path is UNCHANGED; the penalized
+                        # quantity is mean(relu(logZ_c - tau)**2) (gauge-invariant).
+                        (self._last_zloss, self._last_logZ_c,
+                         self._last_h_mu) = _centered_zloss_deadband(
+                            h_flat, self.output.weight, tgt_flat, pad_id,
+                            self._zloss_tau, self._zloss_fp32_accum,
+                        )
+                        # Keep the legacy logZ diag fields populated (centered analogues)
+                        # so the existing logger / zloss_diag don't see None. The clean
+                        # centered telemetry is in _last_logZ_c / _last_h_mu + the val-
+                        # cadence logZ_c logging.
+                        self._last_logz = self._last_logZ_c
+                        self._last_logz_rms = self._last_zloss.detach().clamp_min(0).sqrt()
+                        self._last_logz_p95 = self._last_logZ_c
+                    else:
+                        # Option D: no [N,V] materialization. Backend bool selects
+                        # CCE fp32 accumulation in its backward (see _zloss_optionD).
+                        (self._last_zloss, self._last_logz,
+                         self._last_logz_rms, self._last_logz_p95) = _zloss_optionD(
+                            h_flat, self.output.weight, tgt_flat, pad_id,
+                            self._zloss_fp32_accum,
+                        )
 
             # MoE balance losses: fold in from layers that actually ran this
             # forward. Crucially we scope the loop to the active range —
