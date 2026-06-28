@@ -147,6 +147,40 @@ def _ensure_adam16bit_imports():
     return _adam16bit_imports
 
 
+# ---------------------------------------------------------------------------
+# Head applied-update gauge projection (dn4 head-hygiene; lazy import, no hard
+# dep on row_center). Removes the CE-invisible common-mode gauge from the LM
+# head's APPLIED Adam update U=m/sqrt(v): U <- U - 1*mean_vocab(U)^T, using the
+# GLOBAL vocab-row mean (fp32 + stochastic-rounding write-back for bf16). NOT a
+# weight projection and NOT an exp_avg projection. See docs/DN4_HEAD_HYGIENE_SPEC.
+# ---------------------------------------------------------------------------
+_row_center_imports = None
+
+def _ensure_row_center_imports():
+    global _row_center_imports
+    if _row_center_imports is None:
+        from row_center import _global_row_mean, _subtract_row_mean_
+        _row_center_imports = (_global_row_mean, _subtract_row_mean_)
+    return _row_center_imports
+
+
+def _project_head_update_gauge_(update, verify=False):
+    """In-place: U <- U - 1*Ubar^T, Ubar = global mean over vocab rows (dim 0).
+    Returns (||Ubar|| before, ||Ubar|| after-or-None). 'after' (verify=True)
+    recomputes the post-write gauge -> ~0 confirms the SR write-back landed; a
+    nonzero 'after' flags a biased bf16 residual. Cheap [D] reductions on the
+    single head param."""
+    _global_row_mean, _subtract_row_mean_ = _ensure_row_center_imports()
+    mu, _ = _global_row_mean(update, vocab_dim=0)
+    ubar_pre = mu.norm().item()
+    _subtract_row_mean_(update, mu, vocab_dim=0)
+    ubar_post = None
+    if verify:
+        mu_after, _ = _global_row_mean(update, vocab_dim=0)
+        ubar_post = mu_after.norm().item()
+    return ubar_pre, ubar_post
+
+
 def _get_adam_state_dtype(state_dtype: str, signed: bool) -> torch.dtype:
     """Return storage dtype for an Adam state tensor.
 
@@ -603,6 +637,13 @@ class Muon(torch.optim.Optimizer):
         # External code (train_mara.py) assigns shared dicts to these after creation.
         self.wd_overrides = {}
         self.lr_scale_overrides = {}
+        # Head applied-update gauge projection (dn4). EMPTY by default -> the hook
+        # in the Adam path is a no-op membership test for every run that doesn't
+        # opt in (train_mara fills this with {id(output.weight)} when enabled).
+        self.head_gauge_ids = set()
+        self._head_gauge_verify = False          # train loop sets True at val cadence
+        self._last_head_ubar_pre = None          # ||Ubar|| before projection (last head step)
+        self._last_head_ubar_post = None         # ||Ubar|| after  (only when _head_gauge_verify)
 
     def _get_work_class(self, p: torch.Tensor) -> tuple[type[Work], int]:
         """
@@ -715,6 +756,18 @@ class Muon(torch.optim.Optimizer):
                         state["step"] += 1
                         update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                              state["step"], group["betas"], group["eps"])
+
+                        # dn4 head-hygiene: project the CE-invisible common-mode gauge out of
+                        # the head's APPLIED update (vocab-row mean), BEFORE WD + the weight
+                        # step. No-op unless this is the head param -- head_gauge_ids is empty
+                        # for every run that doesn't opt in. Projecting U (not exp_avg, not the
+                        # post-step weight) is the gauge-safe lever; see DN4_HEAD_HYGIENE_SPEC.
+                        if id(p) in self.head_gauge_ids:
+                            _pre, _post = _project_head_update_gauge_(
+                                update, verify=self._head_gauge_verify)
+                            self._last_head_ubar_pre = _pre
+                            if _post is not None:
+                                self._last_head_ubar_post = _post
 
                         # Weight Decay scaled by lr_scale so a zeroed-out
                         # lr_scale (SCS freeze, lr_mods, etc.) freezes the
