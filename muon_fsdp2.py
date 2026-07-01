@@ -417,6 +417,13 @@ class Fsdp1dWork:
             all_reduce(_stats, group=pg)                                  # global sums over shards
             _dot, _wsq = _stats[0].item(), _stats[1].item()
             if _wsq > 0:
+                # Shadow-norm body controller telemetry: ‖W‖ and the measured free radial-growth
+                # rate γ = −⟨U,W⟩/‖W‖² (RAW, may be <0 = inward radial; the controller clamps/
+                # smooths). Both GLOBAL (all-reduced above) and float (post-.item()), so keyed by
+                # id(param) like wd_overrides/lr_scale_overrides. See docs/SHADOW_NORM_PDR_CONTROLLER_SPEC.md.
+                _rs = getattr(self, "radial_stats", None)
+                if _rs is not None:
+                    _rs[id(self.param)] = (_wsq ** 0.5, -_dot / _wsq)
                 # Partial-projection strength f in [0,1] (default 1.0): remove only fraction f of
                 # the radial component, so ‖W‖ grows at (1-f) of its natural rate. f=1 = full
                 # projection (flat ‖W‖, the original behavior); f=0 = no projection (free growth).
@@ -637,6 +644,11 @@ class Muon(torch.optim.Optimizer):
         # External code (train_mara.py) assigns shared dicts to these after creation.
         self.wd_overrides = {}
         self.lr_scale_overrides = {}
+        # Radial telemetry produced by the tangent-projection block (body matrices only),
+        # consumed by the shadow-norm body controller: id(param) -> (‖W‖, γ) where
+        # γ = −⟨U,W⟩/‖W‖² is the measured free radial-growth rate per unit LR. Transient
+        # (overwritten each step, never checkpointed). EMPTY unless tangent_project is on.
+        self.radial_stats = {}
         # Head applied-update gauge projection (dn4). EMPTY by default -> the hook
         # in the Adam path is a no-op membership test for every run that doesn't
         # opt in (train_mara fills this with {id(output.weight)} when enabled).
@@ -671,6 +683,11 @@ class Muon(torch.optim.Optimizer):
 
         dq: deque[Work] = deque()
 
+        # Clear the radial telemetry each step so a matrix SKIPPED this step (lr_scale==0 freeze
+        # short-circuit, or the _wsq==0 guard) genuinely yields NO entry — the shadow controller's
+        # accumulator must not re-add a stale prior-step increment as phantom free-growth.
+        self.radial_stats.clear()
+
         for group in self.param_groups:
 
             if group["use_muon"]:
@@ -694,6 +711,7 @@ class Muon(torch.optim.Optimizer):
                     class_work, prefetch_factor = self._get_work_class(p)
 
                     work = class_work(p, state, group, i, self.wd_overrides, self.lr_scale_overrides)
+                    work.radial_stats = self.radial_stats   # only Fsdp1dWork.finish reads it (via getattr)
                     work.start()
                     dq.append(work)
 
