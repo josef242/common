@@ -250,7 +250,9 @@ class BodyLRController:
         self._upper_run: int = 0
         self.upper_alarm: bool = False
         self.upper_alarm_ever: bool = False
-        self._m_ff_raw: Optional[float] = None   # last unclamped feedforward demand r/K_ema (telemetry)
+        # last unclamped demand — telemetry + the upper rail's watch quantity (closed loop: r/K_ema;
+        # shadow modes: the R/S-law m, or r/K_ema in the frozen LR-track tail)
+        self._m_ff_raw: Optional[float] = None
         # self-anchoring (auto) live state
         self.K_anchor: Optional[float] = None       # latched frozen-body plant gain (= pdr_anchor/m_anchor)
         self.lr_anchor: Optional[float] = None       # LR at the anchor step (for r=K_anchor*lr/lr_anchor)
@@ -557,7 +559,6 @@ class BodyLRController:
         # m = exp(g · median[log(R/S)]) = geomean(R/S)^g. g=1.0 (default) = pure shadow ratio; g>1
         # STEEPENS the cut (cooler reference) — the glide-gain tuning knob.
         m_raw = math.exp(self.glide_gain * _median(ratios_log))
-        self._m_ff_raw = m_raw
 
         # K_ema from THIS pdr sample and the m that produced it (current self.m, pre-update):
         # telemetry + the frozen-tail inversion + the lower-rail alarm reference.
@@ -592,6 +593,9 @@ class BodyLRController:
                 phase = "open"          # growth + freeze_handoff:false at f=1 -> R/S continues (no kink)
             else:
                 phase = "ramp"
+        # the unclamped demand of THIS window (R/S law, or r/K_ema in the LR-track tail) — the
+        # quantity the upper rail watches; checkpointed telemetry, same meaning as the closed loop's.
+        self._m_ff_raw = m_target
 
         # guardrails: asymmetric slew -> f-aware floor -> hard clamp
         m_cmd = max(self.m * (1 - self.rate_down), min(self.m * (1 + self.rate_up), m_target))
@@ -619,6 +623,19 @@ class BodyLRController:
         self.alarm = self._alarm_run >= self.alarm_consecutive
         self.alarm_ever = self.alarm_ever or self.alarm
 
+        # UPPER rail (Math Q11, shadow analogue): pinned at m_max while the unclamped demand wants
+        # more (m_target > 1+margin). Post-engagement the free-growth counterfactual S must outgrow
+        # the clamped R, so a persistent R/S >= 1+margin means S is drifting/corrupt (a WIPED S is
+        # fataled at resume; a drifting one is not) — or, in the LR-track tail, the reference is
+        # unreachable. Either would otherwise hold m at m_max SILENTLY. Informational, NOT hot-body
+        # (amplification stays forbidden); mirrors the closed-loop rail above.
+        if self.m >= self.m_max - 1e-9 and m_target > 1.0 + self.upper_margin:
+            self._upper_run += 1
+        else:
+            self._upper_run = 0
+        self.upper_alarm = self._upper_run >= self.alarm_consecutive
+        self.upper_alarm_ever = self.upper_alarm_ever or self.upper_alarm
+
         # cumulative-angle drift monitor (Math §6): Θ_actual=Σpdr vs Θ_ref=Σr. A persistently growing
         # gap = the controller drifting off its OWN reference (shadow estimate / guardrails too weak).
         # Telemetry only — does NOT touch the control path. (Tracking the *reference*; the gap to a
@@ -627,7 +644,7 @@ class BodyLRController:
             self.theta_actual += pdr_ffn
             self.theta_ref += r_eff
 
-        self._last = dict(step=step, f=f, m=self.m, phase=phase, m_ff_raw=m_raw, r=r_eff,
+        self._last = dict(step=step, f=f, m=self.m, phase=phase, m_ff_raw=self._m_ff_raw, r=r_eff,
                           K_ema=K_ema, pdr=pdr_ffn, lam=self.lam_body, lam_S=lam_S,
                           gamma_ema=self._gamma_ema, m_min_f=m_min_f, shadow_n=len(self.S),
                           theta_drift=(self.theta_actual - self.theta_ref), gated=False)
@@ -654,8 +671,10 @@ class BodyLRController:
                 v = d.get(k)
                 return (f" {label}=" + format(v, fmt)) if v is not None else ""
             _flags = ("" if not d.get('stale') else f" STALE×{d.get('dropped', 0)}") + \
-                     ("" if not self.alarm else " ALARM:base-LR-too-high")
+                     ("" if not self.alarm else " ALARM:base-LR-too-high") + \
+                     ("" if not self.upper_alarm else " upper:no-upward-authority")
             return (f"  [ffn-ctrl] SHADOW[{d.get('phase', '?')}] m={d.get('m', float('nan')):.3f}"
+                    f"{_t('m_raw', 'm_ff_raw', '.3f')}"
                     f"{_t('pdr', 'pdr', '.3e')}{_t('r', 'r', '.3e')}{_t('K', 'K_ema', '.3e')}"
                     f"{_t('g', 'gamma_ema', '.3e')}{_t('lam', 'lam', '.4f')}"
                     f"{_t('drift', 'theta_drift', '+.2e')}"

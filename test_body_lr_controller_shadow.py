@@ -228,6 +228,38 @@ def t_stale_hold():
     check("stale flag set", c._last.get("stale") is True)
 
 
+def t_upper_rail_shadow():
+    print("upper rail (shadow): R persistently >= S pegs m at m_max -> alarm at 3 consecutive; clears on recovery")
+    c = make_shadow()
+    c.observe(0, 0.0, 3e-3, scheduled_lr=3.5e-4, f_now=0.5,
+              radial={"w1": (200.0, 0.0, 0.1)}, eta_accum=0.03)   # engage: S=200, m held 1
+    # R jumps ABOVE the counterfactual S and stays there (a drifting/corrupt S presents exactly like
+    # this): demand m_raw=R/S > 1+margin while m is clamped at m_max=1.0 (cuts-only, never amplify).
+    m = None
+    for k in range(2):
+        m = c.observe(50 * (k + 1), 0.0, 3e-3, scheduled_lr=3.5e-4, f_now=0.5,
+                      radial={"w1": (220.0, 0.0, 0.1)}, eta_accum=0.03)
+    check("m stays clamped at m_max", abs(m - 1.0) < 1e-12, f"m={m}")
+    check("demand recorded above margin", c._m_ff_raw > 1.0 + c.upper_margin,
+          f"m_ff_raw={c._m_ff_raw}")
+    check("no alarm at 2 consecutive (alarm_consecutive=3)", c.upper_alarm is False,
+          f"run={c._upper_run}")
+    c.observe(150, 0.0, 3e-3, scheduled_lr=3.5e-4, f_now=0.5,
+              radial={"w1": (220.0, 0.0, 0.1)}, eta_accum=0.03)
+    check("upper_alarm fires at 3 consecutive", c.upper_alarm is True, f"run={c._upper_run}")
+    check("lower rail NOT tripped by it", c.alarm is False)
+    check("log line carries the upper flag", "upper:no-upward-authority" in c.log_line(),
+          c.log_line())
+    check("log line carries m_raw", "m_raw=" in c.log_line(), c.log_line())
+    # recovery: R back below S -> demand < 1 -> m unpins, run resets, alarm clears (current-state,
+    # not latched); *_ever keeps the historical record
+    c.observe(200, 0.0, 3e-3, scheduled_lr=3.5e-4, f_now=0.5,
+              radial={"w1": (150.0, 0.0, 0.1)}, eta_accum=0.03)
+    check("alarm clears when demand recedes", c.upper_alarm is False and c._upper_run == 0,
+          f"run={c._upper_run}")
+    check("upper_alarm_ever keeps the record", c.upper_alarm_ever is True)
+
+
 def t_engage_seam():
     print("engage seam: first f>0 observe HOLDS m=1 (S=R), integral starts the NEXT window")
     c = make_shadow()
@@ -347,7 +379,7 @@ def main():
     print(f"\n=== shadow-norm controller tests (state v{_STATE_VERSION}) ===\n")
     for t in (t_idle, t_engage_seam, t_ramp_monotone, t_floor_binds, t_wd_law, t_handoff_growth,
               t_partial_no_handoff, t_freeze_handoff_off, t_freeze_handoff_resume_guard,
-              t_multi_matrix_median, t_dR_clip, t_glide_gain,
+              t_multi_matrix_median, t_dR_clip, t_glide_gain, t_upper_rail_shadow,
               t_state_roundtrip, t_v2_migration, t_stale_hold):
         t()
         print()
