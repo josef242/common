@@ -415,6 +415,10 @@ class ModelArgs:
     swa_enabled: bool = False
     swa_window: int = 512
     swa_global_interleave: int = 4
+    # Multi-token prediction (festival feature 3): DeepSeek-V3-style sequential
+    # module predicting t+2 through one extra block + the shared norm/head.
+    # Loss weight is applied by the trainer (z-loss pattern), not the model.
+    mtp_enabled: bool = False
 
 def _block_attn_res_fn(partial_block, qk, eps, *blocks):
     """AttnRes core — all intermediates recomputed during backward via checkpoint.
@@ -1550,6 +1554,30 @@ class TransformerBlock(nn.Module):
             out = h + self._ffn(self.ffn_norm(h))
         return out
 
+class MTPModule(nn.Module):
+    """DeepSeek-V3-style sequential multi-token-prediction module (depth 1).
+
+    Predicts t+2: h'_i = Block(proj([RMSNorm(h_i); RMSNorm(Emb(t_{i+1}))])),
+    read out through the SHARED final norm + output head (the caller applies
+    them). Trunk gradient flows through h_i (no detach) — that flow IS the
+    training signal MTP exists to add. Never called at inference/generation;
+    reusable later for speculative decoding."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.h_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.emb_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.proj = nn.Linear(2 * args.dim, args.dim, bias=False)
+        self.block = TransformerBlock(args.n_layers, args)
+        # under SWA the MTP block rides the GLOBAL mask (it is a readout head;
+        # capping its view at the window would starve the long-range signal)
+        self.block.swa_local = False
+
+    def forward(self, h, next_emb, freqs_cos, freqs_sin, block_mask=None):
+        x = self.proj(torch.cat([self.h_norm(h), self.emb_norm(next_emb)], dim=-1))
+        return self.block(x, freqs_cos, freqs_sin, block_mask)
+
+
 class Transformer(nn.Module):
     """
     Dense Transformer with isolated training/inference paths.
@@ -1664,6 +1692,28 @@ class Transformer(nn.Module):
             elif '.experts.w2' in pn or '.experts.w3' in pn:
                 torch.nn.init.normal_(p, mean=0.0, std=output_std)
 
+        # MTP (festival feature 3): constructed AND initialized LAST — strictly
+        # after every trunk draw in BOTH init passes above — so adding/removing
+        # MTP cannot shift trunk initialization on any construction path (the
+        # paired-arm property, pinned by the t_mtp parity test). Module
+        # CONSTRUCTION itself consumes RNG (Linear kaiming init), hence the
+        # strict ordering rather than registration tricks. Loss weight lives
+        # trainer-side (z-loss pattern).
+        if getattr(params, 'mtp_enabled', False):
+            if getattr(params, 'gdn_enabled', False):
+                raise RuntimeError(
+                    "mtp_enabled with gdn_enabled is unsupported (the MTP block's "
+                    "layer_id lands on the GDN interleave pattern and would become "
+                    "a recurrent block)")
+            self.mtp = MTPModule(params)
+            self.mtp.apply(self._init_weights)
+            for _pn, _p in self.mtp.named_parameters():
+                if _pn.endswith('w3.weight') or _pn.endswith('wo.weight'):
+                    torch.nn.init.normal_(_p, mean=0.0, std=output_std)
+        else:
+            self.mtp = None
+        self._last_mtp_loss = None
+
         self.last_loss = None
 
         # doc-mask feature guards: fail at construction, not mid-training.
@@ -1741,6 +1791,11 @@ class Transformer(nn.Module):
         output_std = 0.02 / math.sqrt(2 * self.params.n_layers)
 
         for name, module in self.named_modules():
+            # MTP inits in its own pass BELOW — strictly after every trunk draw
+            # (both walks), so the DTensor RNG tracker stream the trunk consumes
+            # is identical with or without MTP (paired-arm property).
+            if name == 'mtp' or name.startswith('mtp.'):
+                continue
             if isinstance(module, nn.Linear):
                 # Use trunc_normal_ like TorchTitan for better stability
                 torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02)
@@ -1766,10 +1821,28 @@ class Transformer(nn.Module):
         # Apply scaled initialization to output projections (w3, wo, GDN o_proj)
         # These benefit from smaller init to prevent output explosion in deep nets
         for name, param in self.named_parameters():
+            if name.startswith('mtp.'):
+                continue  # mtp pass below (after ALL trunk draws)
             if name.endswith('w3.weight') or name.endswith('wo.weight'):
                 torch.nn.init.trunc_normal_(param, mean=0.0, std=output_std)
             elif '.gdn_attn.o_proj.weight' in name:
                 torch.nn.init.trunc_normal_(param, mean=0.0, std=output_std)
+
+        # MTP pass — LAST, after every trunk draw in both loops above, so trunk
+        # init is bit-identical with/without MTP under the same seed (any RNG
+        # the mtp draws consume shifts only what comes after, which is nothing).
+        if self.mtp is not None:
+            for _name, _module in self.mtp.named_modules():
+                if isinstance(_module, nn.Linear):
+                    torch.nn.init.trunc_normal_(_module.weight, mean=0.0, std=0.02)
+                    if _module.bias is not None:
+                        torch.nn.init.zeros_(_module.bias)
+                elif isinstance(_module, RMSNorm):
+                    if hasattr(_module, 'weight') and _module.weight is not None:
+                        torch.nn.init.ones_(_module.weight)
+            for _pn, _p in self.mtp.named_parameters():
+                if _pn.endswith('w3.weight') or _pn.endswith('wo.weight'):
+                    torch.nn.init.trunc_normal_(_p, mean=0.0, std=output_std)
 
         # RoPE tables MUST be recomputed here (torchtitan pattern): in the meta-init
         # flow, to_empty() replaces the value-carrying freqs buffers with uninitialized
@@ -2127,6 +2200,11 @@ class Transformer(nn.Module):
         # uninitialised tail params via the all-gather, and (c) produce a
         # garbage loss against untrained weights. The aux taps captured above
         # carry the supervision.
+        # MTP: capture the pre-final-norm residual stream before self.norm
+        # overwrites h (the sequential module reads the raw trunk state).
+        h_pre_norm = h if (self.mtp is not None and targets is not None
+                           and self.training and not scaffold_mode) else None
+
         if not scaffold_mode:
             h = self.norm(h)
 
@@ -2146,6 +2224,7 @@ class Transformer(nn.Module):
             self._last_logz = None
             self._last_logz_rms = None
             self._last_logz_p95 = None
+            self._last_mtp_loss = None
             _want_zloss = (self._zloss_fp32_accum is not None) and self.training
 
             if scaffold_mode:
@@ -2201,6 +2280,37 @@ class Transformer(nn.Module):
                             h_flat, self.output.weight, tgt_flat, pad_id,
                             self._zloss_fp32_accum,
                         )
+
+                # MTP (DeepSeek-style sequential module): predict t+2 through the
+                # extra block, SHARED final norm + output head. Stashed like z-loss —
+                # the trainer adds lambda * _last_mtp_loss to the objective; headline
+                # ls:/ppl/val stay PURE t+1 CE. Training only (h_pre_norm is None at
+                # eval), so val remains a clean t+1 measurement across arms.
+                # Target alignment: main head at position i predicts targets[i]
+                # (= x_{i+1}); MTP at position i predicts x_{i+2} = targets[i+1],
+                # so mtp targets = targets shifted left once, last column = pad
+                # (ignored). Emb(t_{i+1}) = tok_embeddings(targets) teacher-forces
+                # the intermediate token, per DeepSeek-V3.
+                if h_pre_norm is not None:
+                    next_emb = self.tok_embeddings(targets)
+                    h_mtp = self.mtp(h_pre_norm, next_emb, freqs_cos, freqs_sin,
+                                     block_mask)
+                    h_mtp = self.norm(h_mtp)
+                    mtp_tgt = torch.cat(
+                        [targets[:, 1:],
+                         targets.new_full((targets.shape[0], 1), pad_id)], dim=1)
+                    hm_flat = h_mtp.reshape(-1, h_mtp.size(-1))
+                    if hm_flat.dtype != out_dtype:
+                        hm_flat = hm_flat.to(out_dtype)
+                    self._last_mtp_loss = cce_loss(
+                        hm_flat,
+                        self.output.weight,
+                        mtp_tgt.reshape(-1),
+                        accum_e_fp32=accum_fp32,
+                        accum_c_fp32=accum_fp32,
+                        reduction="mean",
+                        ignore_index=pad_id,
+                    )
 
             # MoE balance losses: fold in from layers that actually ran this
             # forward. Crucially we scope the loop to the active range —

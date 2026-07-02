@@ -263,6 +263,51 @@ def t_swa():
           f"{d_doc:.2e}")
 
 
+def t_mtp():
+    print("MTP: trunk-init parity, eval gating, loss + backward through trunk AND module")
+    S = 128
+    # THE paired-arm property: adding MTP must not shift a single trunk weight.
+    m_off = _tiny_model(n_layers=2, max_seq_len=S)
+    m_on = _tiny_model(n_layers=2, max_seq_len=S, mtp_enabled=True)
+    mismatch = [n for n, p in m_off.named_parameters()
+                if not torch.equal(p, dict(m_on.named_parameters())[n])]
+    check("trunk params bit-identical with/without mtp (RNG order preserved)",
+          not mismatch, str(mismatch[:3]))
+    check("mtp module exists / absent as flagged",
+          m_on.mtp is not None and m_off.mtp is None)
+    check("mtp block rides the GLOBAL mask under swa", m_on.mtp.block.swa_local is False)
+    # eval mode: no mtp loss (val stays pure t+1 CE)
+    tokens = rand_packed_tokens(2, S, seed=9)
+    targets = torch.roll(tokens, -1, dims=1)
+    m_bf = _tiny_model(n_layers=2, max_seq_len=S, mtp_enabled=True,
+                       doc_attn_mask=True, doc_pos_reset=True,
+                       use_activation_checkpointing=True).to(torch.bfloat16)
+    m_bf.eval()
+    with torch.no_grad():
+        m_bf(tokens, targets=targets)
+    check("eval: _last_mtp_loss stays None", m_bf._last_mtp_loss is None)
+    # train mode: loss present, finite, and gradients flow to BOTH trunk and module
+    m_bf.train()
+    _, loss = m_bf(tokens, targets=targets)
+    check("train: main loss finite", torch.isfinite(loss).item())
+    mtp_l = m_bf._last_mtp_loss
+    check("train: mtp loss present + finite",
+          mtp_l is not None and torch.isfinite(mtp_l).item(),
+          str(mtp_l))
+    total = loss + 0.3 * mtp_l
+    total.backward()
+    g_trunk = m_bf.layers[0].attention.wq.weight.grad
+    g_mtp = m_bf.mtp.proj.weight.grad
+    g_emb = m_bf.tok_embeddings.weight.grad
+    check("grad reaches trunk", g_trunk is not None and g_trunk.abs().sum() > 0)
+    check("grad reaches mtp module", g_mtp is not None and g_mtp.abs().sum() > 0)
+    check("grad reaches embeddings (teacher-forced t+1 path)",
+          g_emb is not None and g_emb.abs().sum() > 0)
+    # magnitude sanity: at random init both heads face ~uniform prediction
+    check("mtp loss ~ ln(vocab) at init (alignment produces a REAL CE, not garbage)",
+          3.0 < float(mtp_l) < 6.0, f"{float(mtp_l):.2f} vs ln(64)={math.log(64):.2f}")
+
+
 def t_meta_init_freqs():
     print("meta-init regression: to_empty clobbers RoPE buffers; init_weights must refill them")
     args = ModelArgs(dim=64, n_layers=2, n_heads=4, n_kv_heads=2, vocab_size=64,
@@ -312,7 +357,7 @@ def main():
         sys.exit(2)
     print(f"\n=== doc_attn_mask tests (torch {torch.__version__}, {torch.cuda.get_device_name(0)}) ===\n")
     for t in (t_doc_ids, t_flex_vs_reference, t_no_bos_parity, t_attention_module,
-              t_pos_reset_rope, t_independence, t_model_train_smoke, t_swa,
+              t_pos_reset_rope, t_independence, t_model_train_smoke, t_swa, t_mtp,
               t_meta_init_freqs, t_compile_smoke):
         t()
         print()
