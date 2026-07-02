@@ -405,6 +405,16 @@ class ModelArgs:
     doc_attn_mask: bool = False
     doc_pos_reset: bool = False
     bos_token_id: int = 32000
+    # Sliding-window attention (branch doc-mask, festival feature 2). Hybrid
+    # local:global — a layer is GLOBAL when layer_id % swa_global_interleave ==
+    # swa_global_interleave - 1 (mirrors the GDN interleave convention; 4 -> 3:1
+    # local:global), else LOCAL with a causal window of swa_window tokens.
+    # Local windows compose with doc_attn_mask (window AND same-doc AND causal).
+    # Generation note: forward_with_cache uses the full causal cache, so sampling
+    # is EXACT only while total sequence length <= swa_window; setup_caches warns.
+    swa_enabled: bool = False
+    swa_window: int = 512
+    swa_global_interleave: int = 4
 
 def _block_attn_res_fn(partial_block, qk, eps, *blocks):
     """AttnRes core — all intermediates recomputed during backward via checkpoint.
@@ -1402,6 +1412,14 @@ class TransformerBlock(nn.Module):
             gdn_step = getattr(args, 'gdn_interleave_step', 4)
             self.use_gdn = (layer_id % gdn_step != gdn_step - 1)
 
+        # SWA hybrid: LOCAL (windowed) unless this is a global layer — same
+        # interleave convention as GDN (every Nth layer, at step-1 offsets, is
+        # the exception). False whenever swa is off.
+        self.swa_local = False
+        if getattr(args, 'swa_enabled', False):
+            _swa_step = getattr(args, 'swa_global_interleave', 4)
+            self.swa_local = (layer_id % _swa_step != _swa_step - 1)
+
         if self.use_gdn:
             _try_import_gdn()
             n_gdn_heads = getattr(args, 'n_gdn_heads', None) or args.n_heads
@@ -1466,6 +1484,9 @@ class TransformerBlock(nn.Module):
             # Settings fatals when doc_attn_mask is combined with gdn_enabled.
             out, *_ = self.gdn_attn(x)
             return out
+        if isinstance(block_mask, tuple):
+            # SWA hybrid: (global_mask, local_mask) — pick by this layer's kind.
+            block_mask = block_mask[1] if self.swa_local else block_mask[0]
         return self.attention(x, freqs_cos, freqs_sin, block_mask)
 
     def _forward_block(self, x, freqs_cos, freqs_sin, block_mask=None):
@@ -1654,25 +1675,47 @@ class Transformer(nn.Module):
                 raise RuntimeError(
                     "doc_attn_mask/doc_pos_reset are not supported with gdn_enabled "
                     "(GDN recurrent state crosses document boundaries)")
+        if getattr(self.params, 'swa_enabled', False):
+            if flex_attention is None:
+                raise RuntimeError(
+                    "swa_enabled requires torch >= 2.5 (torch.nn.attention.flex_attention)")
+            if getattr(self.params, 'gdn_enabled', False):
+                raise RuntimeError(
+                    "swa_enabled is not supported with gdn_enabled (GDN layers have no "
+                    "windowed-attention semantics; the hybrid patterns would collide)")
+            if self.params.swa_window >= self.params.max_seq_len:
+                logger_warn = f"swa_window ({self.params.swa_window}) >= max_seq_len " \
+                              f"({self.params.max_seq_len}) — local layers degenerate to full causal"
+                print(logger_warn)
 
-    def _build_doc_block_mask(self, tokens: torch.Tensor):
-        """FlexAttention BlockMask: causal AND same-document, per micro-batch.
+    def _build_block_mask(self, tokens: torch.Tensor, doc: bool, window=None):
+        """FlexAttention BlockMask: causal AND (same-document?) AND (window?).
 
-        Head dim is broadcast (H=None) — one mask serves every layer and head.
-        Runs eagerly (see forward). Cost is NOT free: eager create_block_mask
-        materializes a full-resolution O(B·S²) boolean grid before reducing to
-        block granularity (~500MB transient at B=12/S=2048, ~3-4ms, largely
-        CPU-bound). Amortized over every layer sharing the mask it is well worth
-        it, and the no-BOS dispatch in forward skips it entirely for
-        boundary-free micro-batches — but do not call it per-layer."""
-        doc = doc_ids_from_tokens(tokens, self.params.bos_token_id)
+        Head dim is broadcast (H=None) — one mask serves every layer and head of
+        its kind. Runs eagerly (see forward). Cost is NOT free: eager
+        create_block_mask materializes a full-resolution O(B·S²) boolean grid
+        before reducing to block granularity (~500MB transient at B=12/S=2048,
+        ~3-4ms, largely CPU-bound). Amortized over every layer sharing the mask
+        it is well worth it, and the no-BOS dispatch in forward skips the
+        doc-only variant entirely for boundary-free micro-batches — but do not
+        call it per-layer."""
+        doc_ids = doc_ids_from_tokens(tokens, self.params.bos_token_id) if doc else None
 
         def mask_mod(b, h, q_idx, kv_idx):
-            return (q_idx >= kv_idx) & (doc[b, q_idx] == doc[b, kv_idx])
+            m = q_idx >= kv_idx
+            if window is not None:
+                m = m & (q_idx - kv_idx < window)
+            if doc_ids is not None:
+                m = m & (doc_ids[b, q_idx] == doc_ids[b, kv_idx])
+            return m
 
         B, S = tokens.shape
         return create_block_mask(mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=S,
                                  device=tokens.device)
+
+    def _build_doc_block_mask(self, tokens: torch.Tensor):
+        """Back-compat wrapper: causal AND same-document (no window)."""
+        return self._build_block_mask(tokens, doc=True, window=None)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -1784,6 +1827,12 @@ class Transformer(nn.Module):
                 f"would silently misalign RoPE. Reduce context_size to "
                 f"<= {trained_max}."
             )
+        if getattr(self.params, 'swa_enabled', False) and max_seq_len > self.params.swa_window:
+            print(f"[swa] WARNING: cache length {max_seq_len} > swa_window "
+                  f"({self.params.swa_window}) — forward_with_cache attends the FULL cache "
+                  f"(no rolling window implemented), so sampling matches training semantics "
+                  f"only while the total sequence stays <= swa_window. Longer generations "
+                  f"give local layers out-of-distribution context.")
 
         n_kv_heads = self.params.n_heads if self.params.n_kv_heads is None else self.params.n_kv_heads
         head_dim = self.params.dim // self.params.n_heads
@@ -2006,6 +2055,17 @@ class Transformer(nn.Module):
         else:
             freqs_cos = self.freqs_cos[:S]
             freqs_sin = self.freqs_sin[:S]
+
+        # SWA: LOCAL layers always need a windowed mask (the window constraint is
+        # active regardless of document boundaries; doc confinement composes in when
+        # live). GLOBAL layers keep the mask computed above (doc mask or the SDPA
+        # fast path). Threaded as a (global, local) pair; TransformerBlock._attn
+        # resolves per its layer kind. Flags-off runs never see the tuple.
+        if self.params.swa_enabled:
+            bm_local = self._build_block_mask(
+                tokens, doc=(self.params.doc_attn_mask and _has_bos),
+                window=self.params.swa_window)
+            block_mask = (block_mask, bm_local)
 
         n_active = active_layers if (active_layers is not None and active_layers < len(self.layers)) else len(self.layers)
 

@@ -211,6 +211,58 @@ def t_model_train_smoke():
     check("grads finite", all(torch.isfinite(t).all().item() for t in g))
 
 
+def t_swa():
+    print("SWA: window independence, hybrid dispatch, W>=S degeneracy, doc composition")
+    S = 256
+    # single ALL-LOCAL layer (interleave huge -> no global layers): a token beyond the
+    # window must have EXACTLY zero influence (multi-layer would re-propagate through
+    # depth, so n_layers=1 isolates the window semantics)
+    m1 = _tiny_model(n_layers=1, swa_enabled=True, swa_window=64,
+                     swa_global_interleave=10**6)
+    tokens = torch.randint(6, 64, (1, S), device=DEV)
+    tokens_pert = tokens.clone()
+    tokens_pert[0, 10] = (tokens[0, 10] + 1) % 58 + 6  # perturb ONE early token
+    with torch.no_grad():
+        a, _ = m1(tokens)
+        b, _ = m1(tokens_pert)
+    d_near = (a[0, 11:74] - b[0, 11:74]).abs().max().item()   # inside window of pos 10
+    d_far = (a[0, 100:] - b[0, 100:]).abs().max().item()      # beyond window reach
+    check("inside-window positions DO move", d_near > 1e-6, f"{d_near:.2e}")
+    check("beyond-window positions are BIT-identical (1 local layer)", d_far == 0.0,
+          f"{d_far:.2e}")
+    # hybrid: layer 4k-1 global -> perturbation reaches far positions again
+    mh = _tiny_model(n_layers=4, swa_enabled=True, swa_window=64, swa_global_interleave=4)
+    with torch.no_grad():
+        ha, _ = mh(tokens)
+        hb, _ = mh(tokens_pert)
+    check("hybrid: global layer restores long-range reach",
+          (ha[0, 100:] - hb[0, 100:]).abs().max().item() > 1e-6)
+    check("hybrid layer kinds: 3 local + 1 global",
+          [blk.swa_local for blk in mh.layers] == [True, True, True, False],
+          str([blk.swa_local for blk in mh.layers]))
+    # W >= S degenerates to full causal: must match the plain model exactly
+    mw = _tiny_model(n_layers=2, swa_enabled=True, swa_window=S, swa_global_interleave=4)
+    mp = _tiny_model(n_layers=2)  # same seed -> identical weights
+    with torch.no_grad():
+        wa, _ = mw(tokens)
+        pa, _ = mp(tokens)
+    dW = (wa - pa).abs().max().item()
+    check("W>=S == plain causal through the model", dW < 1e-4, f"{dW:.3e}")
+    # composition: swa + doc mask — cross-doc leak blocked even INSIDE the window
+    mc = _tiny_model(n_layers=1, swa_enabled=True, swa_window=S,
+                     swa_global_interleave=10**6, doc_attn_mask=True)
+    t2 = torch.randint(6, 64, (1, S), device=DEV)
+    t2[0, 50] = BOS
+    t2p = t2.clone()
+    t2p[0, :50] = torch.randint(6, 64, (50,), device=DEV)
+    with torch.no_grad():
+        ca, _ = mc(t2)
+        cb, _ = mc(t2p)
+    d_doc = (ca[0, 50:] - cb[0, 50:]).abs().max().item()
+    check("window + doc: doc-0 rewrite cannot leak into doc-1 (in-window)", d_doc == 0.0,
+          f"{d_doc:.2e}")
+
+
 def t_meta_init_freqs():
     print("meta-init regression: to_empty clobbers RoPE buffers; init_weights must refill them")
     args = ModelArgs(dim=64, n_layers=2, n_heads=4, n_kv_heads=2, vocab_size=64,
@@ -260,8 +312,8 @@ def main():
         sys.exit(2)
     print(f"\n=== doc_attn_mask tests (torch {torch.__version__}, {torch.cuda.get_device_name(0)}) ===\n")
     for t in (t_doc_ids, t_flex_vs_reference, t_no_bos_parity, t_attention_module,
-              t_pos_reset_rope, t_independence, t_model_train_smoke, t_meta_init_freqs,
-              t_compile_smoke):
+              t_pos_reset_rope, t_independence, t_model_train_smoke, t_swa,
+              t_meta_init_freqs, t_compile_smoke):
         t()
         print()
     print(f"=== {PASS[0]} passed, {FAIL[0]} failed ===")
