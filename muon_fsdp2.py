@@ -111,7 +111,12 @@ def zeropower_via_newtonschulz5(G, steps: int):
 
 def apply_momentum(grad, momentum, beta, nesterov):
     momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    # NEVER return the momentum buffer object itself: callers (Fsdp1dWork) assign the
+    # result to param.grad and later scatter/rescale/project INTO that storage in place —
+    # returning `momentum` would alias the buffer and silently destroy accumulation
+    # (each step's "momentum" becomes last step's scaled NS output). grad is scratch
+    # either way, so materialize the nesterov=False update into it.
+    update = grad.lerp_(momentum, beta) if nesterov else grad.copy_(momentum)
     if update.ndim == 4: # for the case of conv filters
         update = update.view(len(update), -1)
     return update
@@ -287,6 +292,20 @@ class Fsdp1dWork:
         self.index = index
 
         self._intermediate_state = None
+
+        # Fail fast on uneven Shard(0) locals: start() sizes every gather buffer as
+        # zeros_like(the DEST rank's own local), so a dim-0 not divisible by world_size
+        # (torch.chunk semantics -> unequal shards) size-mismatches the NCCL gather and
+        # HANGS silently at the first optimizer step (verified empirically). Turn that
+        # into an immediate, explainable launch-time error.
+        if isinstance(param, DTensor) and param.device_mesh.ndim == 1:
+            _ws = param.device_mesh.size()
+            if param.shape[0] % _ws != 0:
+                raise ValueError(
+                    f"Muon FSDP2 gather requires dim-0 divisible by world_size: param shape "
+                    f"{tuple(param.shape)} over {_ws} ranks gives uneven Shard(0) locals, which "
+                    f"deadlocks the gather in Fsdp1dWork.start (silent NCCL hang). Adjust the "
+                    f"model dims or the GPU count.")
     
     def start(self):
 

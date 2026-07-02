@@ -894,6 +894,17 @@ class PercentageDataLoader:
             # even split of the shard into W blocks
             batches_per_rank = max(1, total_batches // W)
             start_batch = self.rank * batches_per_rank
+            if eval_iters is not None and eval_iters > batches_per_rank:
+                # calc_group_loss still draws eval_iters batches per rank, so rank r
+                # reads into rank r+1's block: the all-reduced group loss silently
+                # double-counts overlapping windows. Not fatal (val stays
+                # deterministic), but the degraded mode must be LOUD.
+                logger.print_and_log(
+                    f"{rank_prefix(self.rank)} WARNING set_val_group('{group_name}'): shard "
+                    f"has only {total_batches} batches for {W} ranks ({batches_per_rank}/rank) "
+                    f"but eval_iters={eval_iters} — rank val blocks OVERLAP; the group loss "
+                    f"double-counts shared windows. Use a bigger val shard or lower eval_iters.",
+                    r0_only=False)
 
         shard.position = start_batch * (B * T)
     
