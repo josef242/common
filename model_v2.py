@@ -1724,6 +1724,23 @@ class Transformer(nn.Module):
             elif '.gdn_attn.o_proj.weight' in name:
                 torch.nn.init.trunc_normal_(param, mean=0.0, std=output_std)
 
+        # RoPE tables MUST be recomputed here (torchtitan pattern): in the meta-init
+        # flow, to_empty() replaces the value-carrying freqs buffers with uninitialized
+        # storage and — being persistent=False — nothing else ever refills them. The CUDA
+        # caching allocator deterministically leaves cos=fresh-zero-pages and sin=the
+        # recycled cos block, i.e. attention scores degrade to a separable cos-envelope
+        # instead of relative rotation (found 2026-07-02; every prior meta-init FSDP2 run
+        # trained under that corruption). copy_() is a no-op when values are already
+        # correct, so non-meta construction paths are unaffected.
+        fc, fs = precompute_freqs_cis(
+            self.params.dim // self.params.n_heads,
+            self.params.max_seq_len,
+            self.params.rope_theta,
+        )
+        with torch.no_grad():
+            self.freqs_cos.copy_(fc)
+            self.freqs_sin.copy_(fs)
+
     # =========================================================================
     # KV Cache Management (for inference only)
     # =========================================================================

@@ -211,6 +211,25 @@ def t_model_train_smoke():
     check("grads finite", all(torch.isfinite(t).all().item() for t in g))
 
 
+def t_meta_init_freqs():
+    print("meta-init regression: to_empty clobbers RoPE buffers; init_weights must refill them")
+    args = ModelArgs(dim=64, n_layers=2, n_heads=4, n_kv_heads=2, vocab_size=64,
+                     max_seq_len=128, dropout=0.0, qk_norm_mode="before_rope",
+                     use_keel=True, use_activation_checkpointing=False,
+                     tie_word_embeddings=False)
+    with torch.device("meta"):
+        m = Transformer(args)
+    m = m.to_empty(device=DEV)          # clobbers the value-carrying buffers
+    torch.manual_seed(7)
+    m.init_weights()                     # must recompute the tables
+    ref_cos, ref_sin = precompute_freqs_cis(64 // 4, 128, args.rope_theta)
+    ok_c = torch.allclose(m.freqs_cos.cpu().float(), ref_cos, atol=1e-5)
+    ok_s = torch.allclose(m.freqs_sin.cpu().float(), ref_sin, atol=1e-5)
+    check("freqs_cos correct after meta->to_empty->init_weights", ok_c,
+          f"absmax={m.freqs_cos.float().abs().max().item():.4f}")
+    check("freqs_sin correct after meta->to_empty->init_weights", ok_s)
+
+
 def t_compile_smoke():
     print("torch.compile smoke: compiled Attention with BlockMask input == eager")
     args = ModelArgs(dim=64, n_layers=2, n_heads=4, n_kv_heads=2, vocab_size=64,
@@ -241,7 +260,8 @@ def main():
         sys.exit(2)
     print(f"\n=== doc_attn_mask tests (torch {torch.__version__}, {torch.cuda.get_device_name(0)}) ===\n")
     for t in (t_doc_ids, t_flex_vs_reference, t_no_bos_parity, t_attention_module,
-              t_pos_reset_rope, t_independence, t_model_train_smoke, t_compile_smoke):
+              t_pos_reset_rope, t_independence, t_model_train_smoke, t_meta_init_freqs,
+              t_compile_smoke):
         t()
         print()
     print(f"=== {PASS[0]} passed, {FAIL[0]} failed ===")
