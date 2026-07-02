@@ -1659,8 +1659,12 @@ class Transformer(nn.Module):
         """FlexAttention BlockMask: causal AND same-document, per micro-batch.
 
         Head dim is broadcast (H=None) — one mask serves every layer and head.
-        Runs eagerly (see forward); cost is O(B·S²/block²) mask evaluation on
-        device, negligible next to a transformer step."""
+        Runs eagerly (see forward). Cost is NOT free: eager create_block_mask
+        materializes a full-resolution O(B·S²) boolean grid before reducing to
+        block granularity (~500MB transient at B=12/S=2048, ~3-4ms, largely
+        CPU-bound). Amortized over every layer sharing the mask it is well worth
+        it, and the no-BOS dispatch in forward skips it entirely for
+        boundary-free micro-batches — but do not call it per-layer."""
         doc = doc_ids_from_tokens(tokens, self.params.bos_token_id)
 
         def mask_mod(b, h, q_idx, kv_idx):
@@ -1982,12 +1986,23 @@ class Transformer(nn.Module):
         # The KV-cache generate path (start_pos) is single-document and never
         # reaches this code.
         block_mask = None
-        if self.params.doc_attn_mask:
+        _doc_on = self.params.doc_attn_mask or self.params.doc_pos_reset
+        _has_bos = bool((tokens == self.params.bos_token_id).any()) if _doc_on else False
+        # no-BOS dispatch: a micro-batch with no document boundary has doc-mask == plain
+        # causal (bit-exact, see t_no_bos_parity) and per-doc positions == arange — so take
+        # the SDPA fast path / shared tables. This sidesteps flex-causal's SM86 fwd+bwd
+        # penalty on boundary-free batches, which dominate for long-doc groups (books mean
+        # ~98k tok/doc -> ~2% of windows carry a BOS).
+        if self.params.doc_attn_mask and _has_bos:
             block_mask = self._build_doc_block_mask(tokens)
-        if self.params.doc_pos_reset:
+        if self.params.doc_pos_reset and _has_bos:
             pos = doc_position_ids(tokens, self.params.bos_token_id)  # [B, S]
-            freqs_cos = self.freqs_cos[pos]   # [B, S, D//2] per-sample gather
-            freqs_sin = self.freqs_sin[pos]
+            # gather ONCE and pre-cast to the activation dtype: the FSDP mp_policy would
+            # otherwise cast the fp32 [B,S,D/2] gather per LAYER, pinning ~n_layers bf16
+            # copies under activation checkpointing (~+300MB at dn4 shapes). Layers see
+            # bf16 freqs either way (mp_policy casts the shared fp32 slices today too).
+            freqs_cos = self.freqs_cos[pos].to(h.dtype)
+            freqs_sin = self.freqs_sin[pos].to(h.dtype)
         else:
             freqs_cos = self.freqs_cos[:S]
             freqs_sin = self.freqs_sin[:S]
