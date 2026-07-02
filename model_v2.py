@@ -221,6 +221,20 @@ def _centered_zloss_deadband(h_flat, weight, tgt_flat, pad_id, tau, fp32_accum):
 # ----------------------------------------------------------------------------
 flash_attn_func = None  # Set to actual import if available
 
+# ----------------------------------------------------------------------------
+# FlexAttention (torch >= 2.5) — block-sparse attention for doc_attn_mask.
+# Import-guarded so older torch still loads this module; the feature itself
+# fatals at Settings validation when unavailable. NOTE: flex_attention is only
+# fast inside a torch.compile'd region — the per-submodule compile of each
+# Attention module provides that; uncompiled runs get eager flex (correct but
+# slow), acceptable only for tests.
+# ----------------------------------------------------------------------------
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+except ImportError:
+    flex_attention = None
+    create_block_mask = None
+
 
 # ----------------------------------------------------------------------------
 # Gated DeltaNet (FLA library, optional)
@@ -380,6 +394,17 @@ class ModelArgs:
     # becomes layers[i+1]'s input). Per-head loss weights are applied by the
     # trainer, not the model.
     aux_head_layers: List[int] = field(default_factory=list)
+    # Document attention masking for packed windows (branch doc-mask).
+    # The data stream packs documents separated by BOS; by default attention
+    # flows across document boundaries. doc_attn_mask=True confines attention
+    # to (causal AND same-document) via a FlexAttention BlockMask built per
+    # micro-batch from token==bos_token_id. doc_pos_reset=True restarts RoPE
+    # positions at each BOS (tokens before a window's first BOS keep
+    # window-relative positions — same origin they'd get today). Training/eval
+    # path only; the KV-cache generate path is single-document and unchanged.
+    doc_attn_mask: bool = False
+    doc_pos_reset: bool = False
+    bos_token_id: int = 32000
 
 def _block_attn_res_fn(partial_block, qk, eps, *blocks):
     """AttnRes core — all intermediates recomputed during backward via checkpoint.
@@ -452,15 +477,20 @@ def apply_rotary_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary embeddings using real-valued operations (inductor-friendly)."""
     # xq, xk: [B, S, H, D]
-    # freqs_cos, freqs_sin: [S, D//2]
-    
+    # freqs_cos, freqs_sin: [S, D//2] shared positions, or [B, S, D//2] when
+    # doc_pos_reset gathers per-document positions (each window has its own
+    # BOS layout, so positions differ per sample)
+
     # Split into even/odd (equivalent to real/imag in complex view)
     xq_r, xq_i = xq.float().reshape(*xq.shape[:-1], -1, 2).unbind(-1)
     xk_r, xk_i = xk.float().reshape(*xk.shape[:-1], -1, 2).unbind(-1)
-    
-    # Reshape freqs for broadcasting: [1, S, 1, D//2]
-    cos = freqs_cos[None, :, None, :]  # [1, S, 1, D//2]
-    sin = freqs_sin[None, :, None, :]
+
+    if freqs_cos.ndim == 3:
+        cos = freqs_cos[:, :, None, :]  # [B, S, 1, D//2]
+        sin = freqs_sin[:, :, None, :]
+    else:
+        cos = freqs_cos[None, :, None, :]  # [1, S, 1, D//2]
+        sin = freqs_sin[None, :, None, :]
     
     # Complex multiplication: (a + bi)(c + di) = (ac - bd) + (ad + bc)i
     # Here c = cos, d = sin (unit vector rotation)
@@ -485,6 +515,33 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
+
+
+def doc_ids_from_tokens(tokens: torch.Tensor, bos_id: int) -> torch.Tensor:
+    """Per-token document ids for a packed window [B, S] -> [B, S] int32.
+
+    Inclusive cumsum: a BOS token STARTS a new document (it belongs to the doc
+    it opens, so later tokens of that doc can attend back to it). Tokens before
+    a window's first BOS are the tail of a document cut by the window boundary
+    and share doc id 0."""
+    return (tokens == bos_id).cumsum(dim=-1, dtype=torch.int32)
+
+
+def doc_position_ids(tokens: torch.Tensor, bos_id: int) -> torch.Tensor:
+    """Position-within-document [B, S] -> [B, S] int64: 0 at each BOS,
+    incrementing until the next BOS. Tokens before the first BOS keep
+    window-relative positions — the same origin every window gets under
+    shared (non-reset) positions, so the cut-document fragment trains
+    exactly as it would today."""
+    B, S = tokens.shape
+    idx = torch.arange(S, device=tokens.device).expand(B, S)
+    is_bos = tokens == bos_id
+    # index of the most recent BOS at or before each position; -1 before any
+    last_bos = torch.cummax(
+        torch.where(is_bos, idx, torch.full_like(idx, -1)), dim=-1
+    ).values
+    start = torch.clamp(last_bos, min=0)
+    return idx - start
 
 
 class Attention(nn.Module):
@@ -552,10 +609,14 @@ class Attention(nn.Module):
         self.cache_k: Optional[torch.Tensor] = None
         self.cache_v: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
+    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor,
+                block_mask=None):
         """
         TRAINING PATH - Identical to original model_v1.py
         No caching, no start_pos, no branching on cache existence.
+
+        block_mask: optional FlexAttention BlockMask (doc_attn_mask feature).
+        None -> the existing SDPA/flash causal paths, byte-identical to before.
         """
         bsz, seqlen, _ = x.shape
         
@@ -587,7 +648,19 @@ class Attention(nn.Module):
 
         # ➎ attention computation (avoid materializing repeated KV heads when SDPA supports GQA)
 
-        if self.use_flashattn2:
+        if block_mask is not None:
+            # doc-masked block-sparse attention (FlexAttention). Causality AND
+            # document confinement live in the BlockMask; cross-document blocks
+            # are SKIPPED (block sparsity), not computed-then-masked. GQA is
+            # native via enable_gqa. No dropout arg exists on this path —
+            # Settings fatals if dropout>0 with doc_attn_mask enabled.
+            q = xq.transpose(1, 2)   # [B, Hq, S, D]
+            k = xk.transpose(1, 2)   # [B, Hkv, S, D]
+            v = xv.transpose(1, 2)
+            out = flex_attention(q, k, v, block_mask=block_mask,
+                                 enable_gqa=(self.n_rep > 1))
+            out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        elif self.use_flashattn2:
             # flash-attn path expects matched head counts
             #xk_rep = repeat_kv(xk, self.n_rep)
             #xv_rep = repeat_kv(xv, self.n_rep)
@@ -1386,40 +1459,45 @@ class TransformerBlock(nn.Module):
         """Route through MoE or dense FeedForward."""
         return self.moe(x) if self.moe_enabled else self.feed_forward(x)
 
-    def _attn(self, x, freqs_cos, freqs_sin):
+    def _attn(self, x, freqs_cos, freqs_sin, block_mask=None):
         """Route through GDN or softmax attention."""
         if self.use_gdn:
+            # GDN has no doc masking (recurrent state crosses documents);
+            # Settings fatals when doc_attn_mask is combined with gdn_enabled.
             out, *_ = self.gdn_attn(x)
             return out
-        return self.attention(x, freqs_cos, freqs_sin)
+        return self.attention(x, freqs_cos, freqs_sin, block_mask)
 
-    def _forward_block(self, x, freqs_cos, freqs_sin):
+    def _forward_block(self, x, freqs_cos, freqs_sin, block_mask=None):
         """Inner forward for activation checkpointing."""
         if self.use_keel:
             if self.layer_id == 0:
                 # First block: standard Pre-LN (no Post-LN, no alpha scaling)
-                h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin)
+                h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask)
                 out = h + self._ffn(self.ffn_norm(h))
             else:
                 # KEEL: x_{l+1} = LN(alpha * x_l + F_l(LN(x_l)))
-                attn_out = self._attn(self.attention_norm(x), freqs_cos, freqs_sin)
+                attn_out = self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask)
                 h = self.post_attn_norm(self.keel_alpha * x + attn_out)
                 ffn_out = self._ffn(self.ffn_norm(h))
                 out = self.post_ffn_norm(self.keel_alpha * h + ffn_out)
         else:
             # Original Pre-LN path (unchanged)
-            h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin)
+            h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask)
             out = h + self._ffn(self.ffn_norm(h))
         return out
 
-    def forward(self, x, freqs_cos, freqs_sin):
+    def forward(self, x, freqs_cos, freqs_sin, block_mask=None):
         """
         TRAINING PATH - Uses activation checkpointing when enabled.
         """
         if self.use_activation_checkpointing and self.training:
-            out = cp.checkpoint(self._forward_block, x, freqs_cos, freqs_sin, use_reentrant=False)
+            # Non-reentrant checkpoint passes non-tensor args (BlockMask) through
+            # to the recompute untouched; its int tensors need no grad tracking.
+            out = cp.checkpoint(self._forward_block, x, freqs_cos, freqs_sin, block_mask,
+                                use_reentrant=False)
         else:
-            out = self._forward_block(x, freqs_cos, freqs_sin)
+            out = self._forward_block(x, freqs_cos, freqs_sin, block_mask)
         return out
 
     def forward_with_cache(self, x, freqs_cos, freqs_sin, start_pos: int):
@@ -1566,6 +1644,31 @@ class Transformer(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=output_std)
 
         self.last_loss = None
+
+        # doc-mask feature guards: fail at construction, not mid-training.
+        if (self.params.doc_attn_mask or self.params.doc_pos_reset):
+            if self.params.doc_attn_mask and flex_attention is None:
+                raise RuntimeError(
+                    "doc_attn_mask requires torch >= 2.5 (torch.nn.attention.flex_attention)")
+            if getattr(self.params, 'gdn_enabled', False):
+                raise RuntimeError(
+                    "doc_attn_mask/doc_pos_reset are not supported with gdn_enabled "
+                    "(GDN recurrent state crosses document boundaries)")
+
+    def _build_doc_block_mask(self, tokens: torch.Tensor):
+        """FlexAttention BlockMask: causal AND same-document, per micro-batch.
+
+        Head dim is broadcast (H=None) — one mask serves every layer and head.
+        Runs eagerly (see forward); cost is O(B·S²/block²) mask evaluation on
+        device, negligible next to a transformer step."""
+        doc = doc_ids_from_tokens(tokens, self.params.bos_token_id)
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & (doc[b, q_idx] == doc[b, kv_idx])
+
+        B, S = tokens.shape
+        return create_block_mask(mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=S,
+                                 device=tokens.device)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -1856,8 +1959,21 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
 
-        freqs_cos = self.freqs_cos[:S]
-        freqs_sin = self.freqs_sin[:S]
+        # doc-mask: BlockMask + per-document RoPE positions for packed windows.
+        # Built EAGERLY here (Transformer.forward is not compiled; only the
+        # per-layer submodules are) once per micro-batch, shared by all layers.
+        # The KV-cache generate path (start_pos) is single-document and never
+        # reaches this code.
+        block_mask = None
+        if self.params.doc_attn_mask:
+            block_mask = self._build_doc_block_mask(tokens)
+        if self.params.doc_pos_reset:
+            pos = doc_position_ids(tokens, self.params.bos_token_id)  # [B, S]
+            freqs_cos = self.freqs_cos[pos]   # [B, S, D//2] per-sample gather
+            freqs_sin = self.freqs_sin[pos]
+        else:
+            freqs_cos = self.freqs_cos[:S]
+            freqs_sin = self.freqs_sin[:S]
 
         n_active = active_layers if (active_layers is not None and active_layers < len(self.layers)) else len(self.layers)
 
@@ -1883,7 +1999,7 @@ class Transformer(nn.Module):
                 # Selective retrieval from completed blocks + partial sum
                 h = block_attn_res(blocks, partial_block, self.attn_res_queries[i],
                                    self.attn_res_key_norms[i].weight, self.attn_res_key_norms[i].eps)
-                h_out = blk(h, freqs_cos, freqs_sin)
+                h_out = blk(h, freqs_cos, freqs_sin, block_mask)
                 # Accumulate layer delta (sublayer output) into partial block
                 partial_block = partial_block + (h_out - h)
                 # Block boundary: store completed block, reset accumulator
@@ -1899,19 +2015,19 @@ class Transformer(nn.Module):
             for i, blk in enumerate(self.layers):
                 if i >= n_active:
                     break
-                h = blk(h, freqs_cos, freqs_sin)
+                h = blk(h, freqs_cos, freqs_sin, block_mask)
                 if capture_aux and i in self._aux_head_layer_set:
                     aux_taps[i] = h
         elif capture_aux:
             # Full-depth path with aux heads enabled: enumerate to capture taps.
             for i, blk in enumerate(self.layers):
-                h = blk(h, freqs_cos, freqs_sin)
+                h = blk(h, freqs_cos, freqs_sin, block_mask)
                 if i in self._aux_head_layer_set:
                     aux_taps[i] = h
         else:
             # Full-depth path — identical to original for torch.compile fast path
             for blk in self.layers:
-                h = blk(h, freqs_cos, freqs_sin)
+                h = blk(h, freqs_cos, freqs_sin, block_mask)
 
         # In scaffold_mode the main LM head is intentionally skipped — the
         # partial network's "LM head" is the deepest active aux head, and
