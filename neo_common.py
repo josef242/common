@@ -234,9 +234,22 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                     _ckdir = os.path.dirname(os.path.abspath(checkpoint_path))
                     _cfgs = sorted(_glob.glob(os.path.join(_ckdir, 'config_*.yaml')))
 
+                    # The trainer's derived-fields block dumps some tuples with
+                    # the !!python/tuple tag (e.g. an empty restart_steps), which
+                    # yaml.safe_load REFUSES — crashing recovery and silently
+                    # dropping SWA/MTP semantics (generation goes full-causal).
+                    # Tolerate that ONE tag (construct it as a list — safe, no
+                    # arbitrary-object construction, and we only read scalar/dict
+                    # festival fields) so the parse survives.
+                    class _CfgLoader(_yaml.SafeLoader):
+                        pass
+                    _CfgLoader.add_constructor(
+                        'tag:yaml.org,2002:python/tuple',
+                        lambda _ld, _node: _ld.construct_sequence(_node))
+
                     def _extract(path):
                         with open(path, 'r', encoding='utf-8') as _f:
-                            _rc = _yaml.safe_load(_f) or {}
+                            _rc = _yaml.load(_f, Loader=_CfgLoader) or {}
                         _dm = _rc.get('doc_attn_mask') or {}
                         _sw = _rc.get('swa') or {}
                         _mt = _rc.get('mtp') or {}
