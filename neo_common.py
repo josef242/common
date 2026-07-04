@@ -548,6 +548,12 @@ def load_model_and_tokenizer(
         if os.path.exists(candidate):
             special_tokens = candidate
 
+    # Capture the RoPE-mode keys BEFORE freeing chk_meta — the envelope AUTO
+    # resolution below runs after the (memory-hungry) model build, where chk_meta
+    # is long gone.
+    _ckpt_rope_fixed = chk_meta.get("rope_fixed", None)
+    _ckpt_version = chk_meta.get("checkpoint_version", "2.0")
+
     del chk_meta  # Free memory, will be reloaded in _build_model_from_checkpoint
 
     if tok_path is None and tok_kind in ("llama", "hf"):
@@ -594,8 +600,8 @@ def load_model_and_tokenizer(
     if envelope_compat is None:
         envelope_compat = ENVELOPE_COMPAT_DEFAULT
     if envelope_compat is None:
-        _rf = chk_meta.get("rope_fixed", None)
-        _ver = chk_meta.get("checkpoint_version", "2.0")
+        _rf = _ckpt_rope_fixed          # captured before chk_meta was freed
+        _ver = _ckpt_version
         if _rf is not None:
             envelope_compat = not bool(_rf)
             _why = f"rope_fixed={_rf}"
