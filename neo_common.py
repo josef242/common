@@ -180,11 +180,13 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
         # FSDP2 checkpoint (v3.0 and up — v4.0 adds festival self-describe +
         # rope_fixed but is the SAME format) - use common_fsdp2 model.
         from model_v2 import Transformer, ModelArgs
-        logger.print_and_log(f"Detected FSDP2 checkpoint (v{checkpoint_version}), step: {checkpoint_step}")
+        logger.print_and_log(f"Detected FSDP2 checkpoint (v{checkpoint_version}), step: {checkpoint_step} "
+                             f"-> common_fsdp2.model_v2 (filter-based config)")
     else:
         # FSDP1 checkpoint - use saved FSDP1 model (has __call__ override for KV cache)
         from common_fsdp1.model_v2 import Transformer, ModelArgs
-        logger.print_and_log(f"Detected FSDP1 checkpoint (v{checkpoint_version}), step: {checkpoint_step}")
+        logger.print_and_log(f"Detected FSDP1 checkpoint (v{checkpoint_version}), step: {checkpoint_step} "
+                             f"-> common_fsdp1.model_v2 (explicit-arg config)")
 
     # Temp Hack for old checkpoint compatibility
     import model_v2 as _model_v2
@@ -192,6 +194,7 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
     sys.modules['model_v1_AdamC'] = _model_v2
 
     cfg = chk["config"]
+    _qk_src = "model default"   # overwritten in the dict-config path below
 
     # Handle both old (dataclass) and new (dict) checkpoint formats
     if isinstance(cfg, dict):
@@ -200,22 +203,27 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
         if "hidden_dim" in cfg and "inner_dim" not in cfg:
             cfg["inner_dim"] = cfg["hidden_dim"]
 
-        # Determine qk_norm_mode
+        # Determine qk_norm_mode — track PROVENANCE (shown in the banner) since
+        # qk_norm changes attention numerics; a CLI override that disagrees with
+        # the checkpoint is exactly the case a human needs to see.
         if qk_norm_mode is not None:
             # Explicit override from command line
             resolved_qk_norm_mode = qk_norm_mode if qk_norm_mode != "none" else None
+            _qk_src = "CLI override"
         else:
             # Auto-detect from checkpoint
             if "qk_norm_mode" in cfg:
                 # New format: mode string directly in config
                 resolved_qk_norm_mode = cfg["qk_norm_mode"]
+                _qk_src = "from checkpoint"
             elif cfg.get("qk_norm", False):
                 # Old format: boolean qk_norm=True → legacy behavior
                 resolved_qk_norm_mode = "after_rope_legacy"
-                logger.print_and_log("Detected old qk_norm=True, using 'after_rope_legacy' mode")
+                _qk_src = "legacy qk_norm=True coercion"
             else:
                 # No QK norm
                 resolved_qk_norm_mode = None
+                _qk_src = "checkpoint has no qk_norm"
 
         if _ckpt_version_ge(checkpoint_version, 3.0):
             # FSDP2 (v3.0+): use filter approach - pass all config keys through to
@@ -295,6 +303,13 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                                 f"swa={_recovered['swa_enabled']} (W={_recovered['swa_window']}, "
                                 f"int={_recovered['swa_global_interleave']}), "
                                 f"mtp={_recovered['mtp_enabled']}")
+                        else:
+                            # recovery ran and parsed cleanly but every flag is
+                            # off — state that outcome so it's distinguishable
+                            # from "recovery never ran".
+                            logger.print_and_log(
+                                f"Festival features recovered from {os.path.basename(_cfgs[-1])}: "
+                                f"all off (doc_mask/swa/mtp=False)")
                     else:
                         # No run config next to the checkpoint (the documented
                         # copy-to-V:/code/ckpt workflow strips it). MTP is
@@ -324,10 +339,20 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
             # use_keel: CLI override takes priority, then checkpoint value
             if use_keel is not None:
                 model_args["use_keel"] = use_keel
+                logger.print_and_log(f"  [use_keel] {use_keel} (CLI override — checkpoint said "
+                                     f"{cfg.get('use_keel', 'unset')})")
             # Backwards compat: tie_word_embeddings defaults to True for old checkpoints
-            model_args.setdefault("tie_word_embeddings", True)
-            # Filter to known ModelArgs fields
+            if "tie_word_embeddings" not in model_args:
+                model_args["tie_word_embeddings"] = True
+                logger.print_and_log("  [tie_word_embeddings] True (ASSUMED — absent from checkpoint config)")
+            # Filter to known ModelArgs fields; surface any dropped keys so a
+            # schema drift between the checkpoint and the current ModelArgs is
+            # visible rather than silent.
             known_fields = {f.name for f in dataclasses.fields(ModelArgs)}
+            _dropped = sorted(set(model_args) - known_fields)
+            if _dropped:
+                logger.print_and_log(f"  [config] {len(_dropped)} checkpoint field(s) not in ModelArgs, "
+                                     f"ignored: {_dropped}")
             model_args = {k: v for k, v in model_args.items() if k in known_fields}
             cfg = ModelArgs(**model_args)
         else:
@@ -351,6 +376,8 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
             cfg = ModelArgs(**model_args)
     elif not hasattr(cfg, "vocab_size"):
         # Very old format - pre-ModelArgs checkpoints (always FSDP1)
+        logger.print_and_log("[legacy] very old pre-ModelArgs checkpoint: FABRICATING "
+                             "vocab_size=32000, rope_theta=10000, n_kv_heads=None (not stored)")
         cfg = ModelArgs(
             dim=cfg["dim"],
             n_layers=cfg["n_layers"],
@@ -370,7 +397,10 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
         _old_fields = {f.name: getattr(cfg, f.name) for f in _dc.fields(cfg) if f.name != "multiple_of"}
         _old_fields["use_activation_checkpointing"] = False
         _old_fields.setdefault("tie_word_embeddings", True)
-        _old_fields.setdefault("rope_theta", 10000.0)  # v1 default was 10000, v2 default is 500000
+        if "rope_theta" not in _old_fields:
+            _old_fields["rope_theta"] = 10000.0   # v1 default was 10000, v2 default is 500000
+            logger.print_and_log("[legacy] old v1 ModelArgs: defaulting rope_theta=10000 "
+                                 "(v1 default; NOT read from checkpoint)")
         _known = {f.name for f in _dc.fields(ModelArgs)}
         cfg = ModelArgs(**{k: v for k, v in _old_fields.items() if k in _known})
 
@@ -381,7 +411,7 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
     logger.print_and_log(f"  dim: {cfg.dim}, n_layers: {cfg.n_layers}, n_heads: {cfg.n_heads}, n_kv_heads: {cfg.n_kv_heads}")
     logger.print_and_log(f"  vocab_size: {cfg.vocab_size}, max_seq_len: {cfg.max_seq_len}")
     logger.print_and_log(f"  inner_dim: {cfg.inner_dim}, norm_eps: {cfg.norm_eps}")
-    logger.print_and_log(f"  rope_theta: {getattr(cfg, 'rope_theta', 'N/A')}, qk_norm_mode: {cfg.qk_norm_mode}")
+    logger.print_and_log(f"  rope_theta: {getattr(cfg, 'rope_theta', 'N/A')}, qk_norm_mode: {cfg.qk_norm_mode} ({_qk_src})")
     logger.print_and_log(f"  tie_word_embeddings: {getattr(cfg, 'tie_word_embeddings', 'N/A')}, dropout: {cfg.dropout}")
     if getattr(cfg, 'use_keel', False):
         logger.print_and_log(f"  use_keel: {cfg.use_keel}, keel_alpha: {cfg.keel_alpha}")
@@ -396,12 +426,35 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
         if getattr(cfg, 'moe_interleave_step', 1) > 1:
             moe_info += f", interleave={cfg.moe_interleave_step}"
         logger.print_and_log(moe_info)
+    # Festival features — these change generation SEMANTICS (windowed vs full-
+    # causal, doc isolation, spec-decode availability), so surface them
+    # unconditionally from the resolved cfg. An affirmative "none" line is
+    # printed when all three are off so their absence is stated, not just missing.
+    _festival = []
+    if getattr(cfg, 'doc_attn_mask', False):
+        _festival.append(f"doc-mask on (reset_positions={getattr(cfg, 'doc_pos_reset', False)}, "
+                         f"bos={getattr(cfg, 'bos_token_id', '?')})")
+    if getattr(cfg, 'swa_enabled', False):
+        _festival.append(f"SWA window={getattr(cfg, 'swa_window', '?')}, "
+                        f"interleave={getattr(cfg, 'swa_global_interleave', '?')}")
+    if getattr(cfg, 'mtp_enabled', False):
+        _festival.append("MTP on (self-speculative decode available)")
+    logger.print_and_log(f"  festival: {' | '.join(_festival) if _festival else 'none (all off)'}")
+    if getattr(cfg, 'gdn_enabled', False):
+        logger.print_and_log(f"  GDN: interleave={getattr(cfg, 'gdn_interleave_step', '?')}, "
+                             f"n_heads={getattr(cfg, 'n_gdn_heads', '?')}, "
+                             f"head_dim={getattr(cfg, 'gdn_head_dim', '?')}, "
+                             f"mode={getattr(cfg, 'gdn_mode', '?')}")
+    if getattr(cfg, 'aux_head_layers', None):
+        logger.print_and_log(f"  aux heads @ layers {list(cfg.aux_head_layers)}")
 
     model = Transformer(cfg)
 
     if half_precision:
         logger.print_and_log("Loading model in half precision (bfloat16)")
         model = model.to(torch.bfloat16)
+    else:
+        logger.print_and_log("Loading model in full precision (float32)")
 
     # Clean state‑dict keys (training wrappers)
     state_dict = chk["model"]
@@ -443,6 +496,18 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
         logger.print_and_log(f"[warn] Unexpected {len(unexpected)} keys in state‑dict: {unexpected[:10]}")
     if not missing and not unexpected:
         logger.print_and_log("State dict loaded cleanly (no missing/unexpected keys)")
+
+    # Model size + MTP-module presence (MTP gates self-speculative decode). Report
+    # for EVERY load path — previously params/size were computed only inside the
+    # balanced-sharding branch, so a plain single-GPU load showed neither.
+    _nparams = sum(p.numel() for p in model.parameters())
+    _size_gb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3
+    _mtp_present = getattr(model, 'mtp', None) is not None
+    _pstr = f"{_nparams / 1e9:.2f}B" if _nparams >= 1e9 else f"{_nparams / 1e6:.1f}M"
+    logger.print_and_log(
+        f"Model: {_pstr} params, {_size_gb:.2f} GB "
+        f"({'bfloat16' if half_precision else 'float32'}) | "
+        f"MTP module: {'present (self-spec decode available)' if _mtp_present else 'absent'}")
 
     return model, cfg
 
@@ -507,20 +572,25 @@ def load_model_and_tokenizer(
     # Load checkpoint metadata and log it
     chk_meta = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
 
-    # Log all checkpoint metadata
+    # Log checkpoint metadata GENERICALLY: iterate the actual saved top-level
+    # keys (minus large blobs and the ones a dedicated line owns) so new saved
+    # fields surface automatically instead of drifting behind a hardcoded
+    # whitelist. Owned elsewhere: step/version/iter -> the "Detected ..." line;
+    # tok_kind/tok_path -> the "Tokenizer:" line; special_tokens -> the "Loaded
+    # special tokens" line.
+    _shown_elsewhere = {"model", "config", "step", "iter", "checkpoint_version",
+                        "tok_kind", "tok_path", "special_tokens"}
     logger.print_and_log("Checkpoint metadata:")
-    # Keys that are actually saved in checkpoints (from train_mara.py)
-    metadata_keys = ["step", "total_tokens_processed", "checkpoint_version",
-                     "tok_kind", "tok_path", "special_tokens",
-                     "optimizer_type", "use_adamc", "max_lr"]
-    for key in metadata_keys:
+    for key in sorted(chk_meta.keys()):
+        if key in _shown_elsewhere:
+            continue
         value = chk_meta.get(key)
-        if value is not None:
-            # Truncate long values for display
-            display_val = str(value)
-            if len(display_val) > 80:
-                display_val = display_val[:77] + "..."
-            logger.print_and_log(f"  {key}: {display_val}")
+        if value is None:
+            continue
+        display_val = str(value)
+        if len(display_val) > 80:
+            display_val = display_val[:77] + "..."
+        logger.print_and_log(f"  {key}: {display_val}")
 
     # Auto-detect tokenizer settings from checkpoint if not provided
     special_tokens_source = "cli" if special_tokens else None
@@ -542,11 +612,16 @@ def load_model_and_tokenizer(
     if tok_path and not os.path.isabs(tok_path) and not os.path.exists(tok_path):
         candidate = os.path.normpath(os.path.join(ckpt_dir, tok_path))
         if os.path.exists(candidate):
+            logger.print_and_log(f"  tok_path '{tok_path}' re-homed relative to checkpoint dir -> {candidate}")
             tok_path = candidate
     if special_tokens and isinstance(special_tokens, str) and not os.path.isabs(special_tokens) and not os.path.exists(special_tokens):
         candidate = os.path.normpath(os.path.join(ckpt_dir, special_tokens))
         if os.path.exists(candidate):
+            logger.print_and_log(f"  special_tokens re-homed relative to checkpoint dir -> {candidate}")
             special_tokens = candidate
+    # Single, post-resolution tokenizer line (the raw pre-resolution values are no
+    # longer echoed by the metadata loop, which could disagree with what's opened).
+    logger.print_and_log(f"Tokenizer: kind={tok_kind}, path={tok_path}")
 
     # Capture the RoPE-mode keys BEFORE freeing chk_meta — the envelope AUTO
     # resolution below runs after the (memory-hungry) model build, where chk_meta
@@ -597,21 +672,27 @@ def load_model_and_tokenizer(
     #   3. AUTO from the checkpoint: an explicit rope_fixed flag wins; otherwise
     #      checkpoint_version >= ROPE_FIX_CHECKPOINT_VERSION means fixed RoPE and
     #      anything older/unmarked is the pre-fix CORRUPTED era.
-    if envelope_compat is None:
+    # Track the decision SOURCE and ALWAYS log the resolved mode — the forced
+    # paths (explicit arg / process default from --fixed_rope/--envelope_compat)
+    # used to be completely silent, so a forced-fixed load emitted zero RoPE
+    # logging and you couldn't confirm the override took effect.
+    if envelope_compat is not None:
+        _rope_src = "explicit arg"
+    else:
         envelope_compat = ENVELOPE_COMPAT_DEFAULT
+        _rope_src = "process default (--envelope_compat/--fixed_rope)" if envelope_compat is not None else None
     if envelope_compat is None:
-        _rf = _ckpt_rope_fixed          # captured before chk_meta was freed
-        _ver = _ckpt_version
-        if _rf is not None:
-            envelope_compat = not bool(_rf)
-            _why = f"rope_fixed={_rf}"
+        # AUTO from the checkpoint: explicit rope_fixed wins, else version.
+        if _ckpt_rope_fixed is not None:
+            envelope_compat = not bool(_ckpt_rope_fixed)
+            _rope_src = f"AUTO from rope_fixed={_ckpt_rope_fixed}"
         else:
-            envelope_compat = not _ckpt_version_ge(_ver, ROPE_FIX_CHECKPOINT_VERSION)
-            _why = f"checkpoint_version={_ver} (fix @ {ROPE_FIX_CHECKPOINT_VERSION})"
-        logger.print_and_log(
-            f"[rope] AUTO -> {'LEGACY/corrupted' if envelope_compat else 'FIXED'} "
-            f"RoPE from {_why}. Override with "
-            f"{'--fixed_rope' if envelope_compat else '--envelope_compat'}.")
+            envelope_compat = not _ckpt_version_ge(_ckpt_version, ROPE_FIX_CHECKPOINT_VERSION)
+            _rope_src = f"AUTO from checkpoint_version={_ckpt_version} (fix @ {ROPE_FIX_CHECKPOINT_VERSION})"
+    logger.print_and_log(
+        f"[rope] {'LEGACY/corrupted' if envelope_compat else 'FIXED'} RoPE "
+        f"({_rope_src}; ckpt rope_fixed={_ckpt_rope_fixed}, v{_ckpt_version}). "
+        f"Override with {'--fixed_rope' if envelope_compat else '--envelope_compat'}.")
     if envelope_compat:
         # Legacy-faithful RoPE: every FSDP2 checkpoint trained before the
         # 2026-07-02 meta-init fix learned under CORRUPTED tables (to_empty()
@@ -700,6 +781,9 @@ def load_model_and_tokenizer(
         model = dispatch_model(model, device_map=device_map)
         logger.print_and_log(f"Model sharded across {len(set(device_map.values()))} devices via Accelerate")
     else:
+        if shard_strategy and shard_strategy != "none" and torch.cuda.device_count() <= 1:
+            logger.print_and_log(f"[shard] strategy={shard_strategy} requested but only "
+                                 f"{torch.cuda.device_count()} GPU visible -> loading on single device")
         model.to(device)
         if device.startswith("cuda"):
             # Only compile if not sharding (compilation doesn't work well with sharded models)
