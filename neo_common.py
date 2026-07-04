@@ -221,6 +221,51 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
             # This is future-proof and automatically handles MoE parameters
             import dataclasses
             model_args = dict(cfg)
+            # Festival-feature fallback: checkpoints saved before the whitelist
+            # gained doc/swa/mtp fields (early wizard-era) don't self-describe
+            # those semantics. Recover them from the newest config_*.yaml sitting
+            # next to the checkpoint (the trainer always writes one). Without
+            # this, an SWA checkpoint would silently generate FULL-CAUSAL and an
+            # MTP module's weights would be dropped on load.
+            if 'swa_enabled' not in model_args or 'mtp_enabled' not in model_args:
+                try:
+                    import glob as _glob
+                    import yaml as _yaml
+                    _ckdir = os.path.dirname(os.path.abspath(checkpoint_path))
+                    _cfgs = sorted(_glob.glob(os.path.join(_ckdir, 'config_*.yaml')))
+                    if _cfgs:
+                        with open(_cfgs[-1], 'r', encoding='utf-8') as _f:
+                            _run_cfg = _yaml.safe_load(_f) or {}
+                        _dm = _run_cfg.get('doc_attn_mask') or {}
+                        _sw = _run_cfg.get('swa') or {}
+                        _mt = _run_cfg.get('mtp') or {}
+                        if _dm is True: _dm = {'enabled': True}
+                        if _sw is True: _sw = {'enabled': True}
+                        if _mt is True: _mt = {'enabled': True}
+                        _recovered = {
+                            'doc_attn_mask': bool(_dm.get('enabled', False)),
+                            'doc_pos_reset': bool(_dm.get('reset_positions', False)),
+                            'bos_token_id': int(_dm.get('bos_token_id', 32000)),
+                            'swa_enabled': bool(_sw.get('enabled', False)),
+                            'swa_window': int(_sw.get('window', 512)),
+                            'swa_global_interleave': int(_sw.get('global_interleave', 4)),
+                            'mtp_enabled': bool(_mt.get('enabled', False)),
+                        }
+                        model_args.update(_recovered)
+                        if any((_recovered['doc_attn_mask'], _recovered['swa_enabled'],
+                                _recovered['mtp_enabled'])):
+                            logger.print_and_log(
+                                f"Festival features recovered from {os.path.basename(_cfgs[-1])}: "
+                                f"doc_mask={_recovered['doc_attn_mask']} "
+                                f"(reset={_recovered['doc_pos_reset']}, bos={_recovered['bos_token_id']}), "
+                                f"swa={_recovered['swa_enabled']} (W={_recovered['swa_window']}, "
+                                f"int={_recovered['swa_global_interleave']}), "
+                                f"mtp={_recovered['mtp_enabled']}")
+                except Exception as _e:
+                    logger.print_and_log(
+                        f"[warn] festival-feature recovery from run-dir yaml failed "
+                        f"({type(_e).__name__}: {_e}) — if this checkpoint used SWA, "
+                        f"generation semantics will be WRONG (full-causal).")
             # Override inference-specific settings
             model_args["ep_degree"] = 1  # single GPU inference
             model_args["use_activation_checkpointing"] = False
@@ -1255,6 +1300,176 @@ def verify_kv_reuse_parity(model, tokenizer, context_size,
     if verbose:
         logger.print_and_log("[kv-reuse parity] " + detail)
     return ok, detail
+
+
+def _warp_probs(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+    """Logits -> sampling distribution under temperature + top-p.
+    temperature == 0 returns a one-hot argmax distribution, so the speculative
+    accept/reject math below degrades EXACTLY to greedy verification."""
+    if temperature <= 0:
+        p = torch.zeros_like(logits)
+        p[logits.argmax()] = 1.0
+        return p
+    probs = torch.softmax(logits / temperature, dim=-1)
+    if top_p < 1.0:
+        sp, si = torch.sort(probs, descending=True)
+        cum = torch.cumsum(sp, dim=-1)
+        remove = cum > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        probs = probs.clone()
+        probs[si[remove]] = 0.0
+        probs = probs / probs.sum()
+    return probs
+
+
+def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
+                  temperature=0.0, top_p=1.0, stop_on_eos=False, seed=None,
+                  prompt_ids=None, on_token=None):
+    """SELF-SPECULATIVE decoding via the model's own MTP module (DeepSeek-style).
+
+    Each round runs ONE trunk forward over [current_token, draft_token] (a
+    2-token chunk costs ~the same as 1 in the memory-bound decode regime) and
+    one tiny MTP-block pass. The draft is verified against the trunk's own
+    distribution with the standard k=1 speculative-sampling rule, so the output
+    distribution equals ordinary (warped) sampling:
+      accept draft B with prob min(1, p(B)/q(B));
+      on reject, sample from normalize(max(0, p - q)).
+    temperature=0 degrades exactly to greedy verification (one-hot p and q).
+    Throughput: tokens/trunk-forward = 1 + acceptance_rate.
+
+    Returns dict: text, token_ids, tokens_generated, rounds, accepted,
+    acceptance_rate, accept_bits (per-round — the 'lookahead meter'),
+    stop_reason, tok_s.
+    """
+    mtp = getattr(model, 'mtp', None)
+    if mtp is None:
+        raise ValueError("spec_generate requires an MTP checkpoint (model.mtp is None) — "
+                         "use generate_with_stats / stream_generate_kv instead")
+    device = next(model.parameters()).device
+
+    if prompt_ids is None:
+        prompt_ids = tokenizer.encode(prompt_text, bos=True, eos=False)
+    prompt_len = len(prompt_ids)
+    if prompt_len >= context_size:
+        return {"text": "", "token_ids": [], "tokens_generated": 0, "rounds": 0,
+                "accepted": 0, "acceptance_rate": 0.0, "accept_bits": [],
+                "stop_reason": "error_prompt_too_long", "tok_s": 0.0}
+    max_new_tokens = min(max_new_tokens, context_size - prompt_len)
+    eos_id = getattr(tokenizer, 'eos_id', None)
+
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+
+    def _sample(p):
+        if temperature <= 0:
+            return int(p.argmax())
+        return int(torch.multinomial(p, 1, generator=generator))
+
+    total_len = prompt_len + max_new_tokens
+    emitted = []
+    rounds = 0
+    accepted = 0
+    accept_bits = []
+    stop_reason = "max_tokens"
+    t0 = time.time()
+
+    with torch.no_grad():
+        model.setup_caches(max_batch_size=1, max_seq_len=total_len)
+        toks = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+
+        # ---- trunk prefill (captures pre-norm h for the MTP backfill) ----
+        logits, h_pre = model.generate_forward(toks, 0, return_h_pre=True)
+        cur = _sample(_warp_probs(logits[0, -1].float(), temperature, top_p))
+        emitted.append(cur)
+        if on_token: on_token(cur)
+
+        # ---- MTP backfill over the whole prompt -> first draft ----
+        nt = torch.tensor(prompt_ids[1:] + [cur], dtype=torch.long,
+                          device=device).unsqueeze(0)
+        mtp_logits = model.mtp_decode_chunk(h_pre, nt, 0)
+        q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
+        draft = _sample(q_probs)
+
+        n_ctx = prompt_len  # trunk+mtp caches materialized through position n_ctx-1
+
+        while len(emitted) < max_new_tokens:
+            if n_ctx + 2 > total_len:
+                stop_reason = "context_limit"
+                break
+            if stop_on_eos and eos_id is not None and emitted and emitted[-1] == eos_id:
+                stop_reason = "eos"
+                break
+            rounds += 1
+            chunk = torch.tensor([[cur, draft]], dtype=torch.long, device=device)
+            logits2, h_pre2 = model.generate_forward(chunk, n_ctx, return_h_pre=True)
+            p1 = _warp_probs(logits2[0, 0].float(), temperature, top_p)
+
+            # k=1 speculative-sampling verification
+            q_d = float(q_probs[draft])
+            p_d = float(p1[draft])
+            if temperature <= 0:
+                ok = (int(p1.argmax()) == draft)
+            else:
+                r = torch.rand((), generator=generator, device=device).item()
+                ok = (q_d > 0) and (r < min(1.0, p_d / q_d))
+
+            if ok:
+                accepted += 1
+                accept_bits.append(1)
+                emitted.append(draft)
+                if on_token: on_token(draft)
+                p2 = _warp_probs(logits2[0, 1].float(), temperature, top_p)
+                nxt = _sample(p2)
+                if len(emitted) < max_new_tokens:
+                    emitted.append(nxt)
+                    if on_token: on_token(nxt)
+                # MTP backfill BOTH rows; row1 (position n_ctx+1) drafts t_{n_ctx+3}
+                nt = torch.tensor([[draft, nxt]], dtype=torch.long, device=device)
+                mtp_logits = model.mtp_decode_chunk(h_pre2, nt, n_ctx)
+                q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
+                draft_new = _sample(q_probs)
+                n_ctx += 2
+                cur = nxt
+                draft = draft_new
+            else:
+                accept_bits.append(0)
+                # residual sampling keeps the output distribution exact
+                resid = torch.clamp(p1 - q_probs, min=0.0)
+                s = float(resid.sum())
+                tok_v = _sample(resid / s) if s > 0 else _sample(p1)
+                emitted.append(tok_v)
+                if on_token: on_token(tok_v)
+                # trunk position n_ctx+1 holds the REJECTED draft's K/V — the next
+                # round's chunk write at n_ctx+1 overwrites it (ring and full
+                # caches both overwrite by position; nothing reads it before then).
+                # MTP backfill row0 only (h_pre of the rejected row is invalid).
+                nt = torch.tensor([[tok_v]], dtype=torch.long, device=device)
+                mtp_logits = model.mtp_decode_chunk(h_pre2[:, :1], nt, n_ctx)
+                q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
+                draft = _sample(q_probs)
+                n_ctx += 1
+                cur = tok_v
+
+        if stop_on_eos and eos_id is not None and eos_id in emitted:
+            emitted = emitted[:emitted.index(eos_id) + 1]
+            stop_reason = "eos"
+
+    dt = max(time.time() - t0, 1e-9)
+    model.set_cache_ledger(list(prompt_ids) + emitted[:max(0, n_ctx - prompt_len)])
+    return {
+        "text": tokenizer.decode(emitted),
+        "token_ids": emitted,
+        "tokens_generated": len(emitted),
+        "rounds": rounds,
+        "accepted": accepted,
+        "acceptance_rate": (accepted / rounds) if rounds else 0.0,
+        "accept_bits": accept_bits,
+        "stop_reason": stop_reason,
+        "tok_s": len(emitted) / dt,
+    }
 
 
 def generate_with_stats(model, tokenizer, prompt_text, max_new_tokens,

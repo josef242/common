@@ -2047,6 +2047,27 @@ class Transformer(nn.Module):
             layer.attention.cache_k = new_k
             layer.attention.cache_v = new_v
 
+        # MTP block cache (speculative decoding): the draft module runs its own
+        # causal attention over the mtp input sequence, so it needs a KV cache
+        # of its own — GLOBAL/full-length (mtp.block.swa_local is forced False).
+        if getattr(self, 'mtp', None) is not None:
+            _att = self.mtp.block.attention
+            _att.cache_window = None
+            _old = _att.cache_k
+            if not (can_preserve and _old is not None and _old.shape[1] == max_seq_len):
+                device = self.mtp.block.attention.wq.weight.device
+                dtype = self.mtp.block.attention.wq.weight.dtype
+                new_k = torch.zeros((max_batch_size, max_seq_len, n_kv_heads, head_dim),
+                                    device=device, dtype=dtype)
+                new_v = torch.zeros((max_batch_size, max_seq_len, n_kv_heads, head_dim),
+                                    device=device, dtype=dtype)
+                if can_preserve and _old is not None:
+                    _copy = min(old_len, _old.shape[1], max_seq_len)
+                    new_k[:, :_copy] = _old[:, :_copy]
+                    new_v[:, :_copy] = _att.cache_v[:, :_copy]
+                _att.cache_k = new_k
+                _att.cache_v = new_v
+
         # Capacity bookkeeping: with per-layer lengths, probing layer 0 (LOCAL
         # under SWA -> W slots) would misreport; store the logical capacity.
         self._cache_bsz = max_batch_size
@@ -2076,6 +2097,9 @@ class Transformer(nn.Module):
                 del layer.attention.cache_v
             layer.attention.cache_k = None
             layer.attention.cache_v = None
+        if getattr(self, 'mtp', None) is not None:
+            self.mtp.block.attention.cache_k = None
+            self.mtp.block.attention.cache_v = None
         self._cache_bsz = None
         self._cache_msl = None
 
@@ -2111,6 +2135,32 @@ class Transformer(nn.Module):
             if not getattr(layer, 'use_gdn', False):
                 return layer.attention.cache_k is not None
         return False  # all layers are GDN
+
+    def mtp_decode_chunk(self, h_pre: torch.Tensor, next_tokens: torch.Tensor,
+                         start_pos: int) -> torch.Tensor:
+        """Speculative-decoding draft pass: run the MTP module over a chunk at
+        inference, using its own KV cache (allocated by setup_caches).
+
+        Args:
+            h_pre: [B, S, D] PRE-final-norm trunk states for absolute positions
+                   [start_pos, start_pos+S) — from generate_forward(return_h_pre=True).
+            next_tokens: [B, S] the token at position i+1 for each chunk row i
+                   (the accepted/known continuation — training's teacher-forced input).
+            start_pos: absolute position of the chunk's first row.
+
+        Returns:
+            logits [B, S, V]: row i predicts t_{i+2} (the DRAFT distribution) —
+            identical readout path to training (shared final norm + output head).
+        """
+        assert self.mtp is not None, "mtp_decode_chunk requires an MTP checkpoint"
+        S = h_pre.shape[1]
+        next_emb = self.tok_embeddings(next_tokens)
+        x = self.mtp.proj(torch.cat(
+            [self.mtp.h_norm(h_pre), self.mtp.emb_norm(next_emb)], dim=-1))
+        freqs_cos = self.freqs_cos[start_pos:start_pos + S]
+        freqs_sin = self.freqs_sin[start_pos:start_pos + S]
+        h = self.mtp.block.forward_with_cache(x, freqs_cos, freqs_sin, start_pos)
+        return self.output(self.norm(h))
 
     def min_rolling_cache_len(self):
         """Smallest live SWA ring capacity, or None when no rolling caches exist.
@@ -2486,7 +2536,8 @@ class Transformer(nn.Module):
     def generate_forward(
         self,
         tokens: torch.Tensor,
-        start_pos: int = 0
+        start_pos: int = 0,
+        return_h_pre: bool = False,
     ) -> torch.Tensor:
         """
         INFERENCE FORWARD with KV caching - for generation.
@@ -2531,6 +2582,12 @@ class Transformer(nn.Module):
             for blk in self.layers:
                 h = blk.forward_with_cache(h, freqs_cos, freqs_sin, start_pos)
 
+        if return_h_pre:
+            # speculative decoding needs the PRE-final-norm trunk state (the
+            # exact tensor the MTP module consumed at training time)
+            h_pre = h
+            h = self.norm(h)
+            return self.output(h), h_pre
         h = self.norm(h)
         logits = self.output(h)
         return logits
