@@ -148,6 +148,45 @@ def t_sampled_determinism():
     check("emitted n_new", a["tokens_generated"] == n_new)
 
 
+def t_eos_ledger_truth():
+    print("EOS handling: stop promptly on ANY arrival path; ledger == materialized cache")
+    class EosTok(StubTok):
+        eos_id = 3
+    m = make_model()  # vocab 16; eos id 3 will appear naturally at high temp
+    prompt = [5, 7, 9, 11]
+    n_new = 40
+    total = len(prompt) + n_new
+    eos_stops = 0
+    for seed in range(30):
+        m.setup_caches(max_batch_size=1, max_seq_len=total, force=True)
+        res = nc.spec_generate(m, EosTok(), None, n_new, total,
+                               temperature=2.5, top_p=1.0, seed=seed,
+                               prompt_ids=prompt, stop_on_eos=True)
+        ledger = m.get_cache_ledger()
+        m.clear_caches()
+        if res["stop_reason"] != "eos":
+            continue
+        eos_stops += 1
+        ids = res["token_ids"]
+        if ids[-1] != 3:
+            check(f"seed {seed}: eos-stop ends with eos", False, str(ids[-8:]))
+            return
+        # THE invariant the buried-EOS bug violated: the ledger must equal the
+        # PHYSICALLY MATERIALIZED tokens — prompt + emitted, at most one
+        # never-forwarded trailing token short, and NEVER positions beyond it.
+        tail = ledger[len(prompt):]
+        ok_tail = (tail == ids) or (tail == ids[:-1])
+        ok_bound = len(ledger) <= len(prompt) + len(ids)
+        ok_rounds = res["rounds"] <= len(ids) + 1  # no post-EOS speculation
+        if not (ok_tail and ok_bound and ok_rounds and ledger[:len(prompt)] == prompt):
+            check(f"seed {seed}: ledger truth", False,
+                  f"ledger_tail={tail[-6:]}, ids={ids[-6:]}, rounds={res['rounds']}")
+            return
+    check("ledger-truth invariant held for every eos stop", True)
+    check("eos stops actually occurred across the seed scan", eos_stops >= 5,
+          f"eos_stops={eos_stops}/30")
+
+
 def t_mtp_cache_lifecycle():
     print("MTP block cache: allocated by setup_caches, cleared by clear_caches")
     m = make_model()
@@ -175,7 +214,7 @@ def main():
     print(f"\n=== MTP speculative decoding tests (CPU, torch {torch.__version__}) ===\n")
     for t in (t_greedy_equality, t_greedy_equality_no_swa, t_accept_branch_coverage,
               t_sampled_determinism,
-              t_mtp_cache_lifecycle, t_no_mtp_raises):
+              t_eos_ledger_truth, t_mtp_cache_lifecycle, t_no_mtp_raises):
         t()
         print()
     print(f"=== {PASS[0]} passed, {FAIL[0]} failed ===")

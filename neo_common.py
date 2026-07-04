@@ -233,16 +233,17 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                     import yaml as _yaml
                     _ckdir = os.path.dirname(os.path.abspath(checkpoint_path))
                     _cfgs = sorted(_glob.glob(os.path.join(_ckdir, 'config_*.yaml')))
-                    if _cfgs:
-                        with open(_cfgs[-1], 'r', encoding='utf-8') as _f:
-                            _run_cfg = _yaml.safe_load(_f) or {}
-                        _dm = _run_cfg.get('doc_attn_mask') or {}
-                        _sw = _run_cfg.get('swa') or {}
-                        _mt = _run_cfg.get('mtp') or {}
+
+                    def _extract(path):
+                        with open(path, 'r', encoding='utf-8') as _f:
+                            _rc = _yaml.safe_load(_f) or {}
+                        _dm = _rc.get('doc_attn_mask') or {}
+                        _sw = _rc.get('swa') or {}
+                        _mt = _rc.get('mtp') or {}
                         if _dm is True: _dm = {'enabled': True}
                         if _sw is True: _sw = {'enabled': True}
                         if _mt is True: _mt = {'enabled': True}
-                        _recovered = {
+                        return {
                             'doc_attn_mask': bool(_dm.get('enabled', False)),
                             'doc_pos_reset': bool(_dm.get('reset_positions', False)),
                             'bos_token_id': int(_dm.get('bos_token_id', 32000)),
@@ -251,6 +252,20 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                             'swa_global_interleave': int(_sw.get('global_interleave', 4)),
                             'mtp_enabled': bool(_mt.get('enabled', False)),
                         }
+
+                    if _cfgs:
+                        _all = {c: _extract(c) for c in _cfgs}
+                        _recovered = _all[_cfgs[-1]]
+                        if len({tuple(sorted(v.items())) for v in _all.values()}) > 1:
+                            # a resumed run dir whose restarts DISAGREE on the
+                            # festival flags: the newest yaml may postdate this
+                            # checkpoint's semantics — the user must adjudicate
+                            logger.print_and_log(
+                                f"[warn] {len(_cfgs)} config_*.yaml in the run dir DISAGREE on "
+                                f"festival flags — using the NEWEST ({os.path.basename(_cfgs[-1])}). "
+                                f"If this checkpoint predates a flag flip, generation semantics "
+                                f"will be wrong; verify against the config saved nearest the "
+                                f"checkpoint's launch.")
                         model_args.update(_recovered)
                         if any((_recovered['doc_attn_mask'], _recovered['swa_enabled'],
                                 _recovered['mtp_enabled'])):
@@ -261,6 +276,22 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                                 f"swa={_recovered['swa_enabled']} (W={_recovered['swa_window']}, "
                                 f"int={_recovered['swa_global_interleave']}), "
                                 f"mtp={_recovered['mtp_enabled']}")
+                    else:
+                        # No run config next to the checkpoint (the documented
+                        # copy-to-V:/code/ckpt workflow strips it). MTP is
+                        # detectable from weights; SWA is NOT — warn LOUDLY.
+                        _has_mtp_w = any(
+                            k.replace('_orig_mod.', '').startswith('mtp.')
+                            for k in chk.get('model', {}))
+                        logger.print_and_log(
+                            f"[warn] checkpoint config lacks festival-feature fields and NO "
+                            f"config_*.yaml sits next to it — cannot recover doc-mask/SWA/MTP "
+                            f"semantics. MTP weights {'DETECTED' if _has_mtp_w else 'not found'} "
+                            f"in the state dict. If this checkpoint was trained with SWA, "
+                            f"generation will be FULL-CAUSAL (silently wrong) — copy the run's "
+                            f"config_*.yaml next to the checkpoint and reload.")
+                        if _has_mtp_w:
+                            model_args['mtp_enabled'] = True
                 except Exception as _e:
                     logger.print_and_log(
                         f"[warn] festival-feature recovery from run-dir yaml failed "
@@ -1421,11 +1452,31 @@ def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
                 accept_bits.append(1)
                 emitted.append(draft)
                 if on_token: on_token(draft)
+                if stop_on_eos and eos_id is not None and draft == eos_id:
+                    # EOS accepted as FIRST of the pair: stop HERE. Without this,
+                    # the loop speculates to the token cap, writing post-EOS
+                    # positions into the caches while the post-loop truncation
+                    # shrinks `emitted` — the ledger would then UNDERSTATE the
+                    # materialized high-water mark and re-arm the wrong-timeline
+                    # ring-reuse corruption the rewind guard cannot see
+                    # (start_pos == len(ledger) looks like clean append).
+                    # Both chunk rows (cur, draft) ARE materialized -> n_ctx += 2
+                    # keeps the ledger arithmetic exact.
+                    n_ctx += 2
+                    stop_reason = "eos"
+                    break
                 p2 = _warp_probs(logits2[0, 1].float(), temperature, top_p)
                 nxt = _sample(p2)
                 if len(emitted) < max_new_tokens:
                     emitted.append(nxt)
                     if on_token: on_token(nxt)
+                if stop_on_eos and eos_id is not None and nxt == eos_id:
+                    # EOS as second of the pair: nxt is emitted but NEVER
+                    # forwarded — n_ctx += 2 covers exactly the materialized
+                    # rows (cur, draft); the ledger slice excludes nxt.
+                    n_ctx += 2
+                    stop_reason = "eos"
+                    break
                 # MTP backfill BOTH rows; row1 (position n_ctx+1) drafts t_{n_ctx+3}
                 nt = torch.tensor([[draft, nxt]], dtype=torch.long, device=device)
                 mtp_logits = model.mtp_decode_chunk(h_pre2, nt, n_ctx)
@@ -1453,12 +1504,17 @@ def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
                 n_ctx += 1
                 cur = tok_v
 
+        # LEDGER SNAPSHOT BEFORE ANY TRUNCATION (set_cache_ledger's contract:
+        # exactly the ids physically forwarded into the cache — defense in
+        # depth against any future truncation path desyncing ledger vs cache).
+        materialized_ids = list(prompt_ids) + emitted[:max(0, n_ctx - prompt_len)]
+
         if stop_on_eos and eos_id is not None and eos_id in emitted:
             emitted = emitted[:emitted.index(eos_id) + 1]
             stop_reason = "eos"
 
     dt = max(time.time() - t0, 1e-9)
-    model.set_cache_ledger(list(prompt_ids) + emitted[:max(0, n_ctx - prompt_len)])
+    model.set_cache_ledger(materialized_ids)
     return {
         "text": tokenizer.decode(emitted),
         "token_ids": emitted,
