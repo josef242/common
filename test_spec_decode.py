@@ -31,7 +31,10 @@ def check(name, cond, extra=""):
 class StubTok:
     eos_id = None
     def encode(self, text, bos=True, eos=False): raise RuntimeError("use prompt_ids")
-    def decode(self, ids): return " ".join(map(str, ids))
+    # composition-consistent: decode(a+b) == decode(a)+decode(b), so the
+    # token-by-token streaming path and full-list decode agree (required for
+    # stop-sequence tests to see the same text the stream accumulates)
+    def decode(self, ids): return "".join(f"<{i}>" for i in ids)
 
 
 def make_model(vocab=16, **over):
@@ -198,6 +201,55 @@ def t_mtp_cache_lifecycle():
     check("cleared", m.mtp.block.attention.cache_k is None)
 
 
+def t_stream_engine_parity():
+    print("stream_generate_kv: spec engine is a DROP-IN — greedy text bit-identical to")
+    print("classic, stop-sequences honored mid-round, spec stats surfaced")
+
+    class EncTok(StubTok):
+        def __init__(self, ids): self._ids = list(ids)
+        def encode(self, text, bos=True, eos=False): return list(self._ids)
+
+    prompt_ids = [5, 7, 9, 11, 6, 8]
+    tok = EncTok(prompt_ids)
+    m = make_model()
+    n_new = 40
+    ctx = len(prompt_ids) + n_new
+
+    ref_text, ref_info = nc.stream_generate_kv(
+        m, tok, "p", n_new, ctx, temperature=0.0, top_p=1.0,
+        display=False, print_prompt=False, return_stop_info=True, spec=False)
+    spec_text, spec_info = nc.stream_generate_kv(
+        m, tok, "p", n_new, ctx, temperature=0.0, top_p=1.0,
+        display=False, print_prompt=False, return_stop_info=True, spec=None)
+    check("greedy text bit-identical (auto-spec vs classic)", spec_text == ref_text,
+          f"spec[:60]={spec_text[:60]!r} ref[:60]={ref_text[:60]!r}")
+    check("spec stats surfaced in stop_info", "spec" in spec_info,
+          str(spec_info))
+    check("classic path has no spec stats", "spec" not in ref_info)
+    check("token counts match", spec_info["tokens_generated"] == ref_info["tokens_generated"])
+
+    # stop-sequence parity: stop on the decoded text of a frequent token
+    ref2, ri2 = nc.stream_generate_kv(
+        m, tok, "p", n_new, ctx, temperature=0.0, top_p=1.0, display=False,
+        print_prompt=False, return_stop_info=True, spec=False,
+        stop_sequences=[ref_text[len(ref_text)//2: len(ref_text)//2 + 4]])
+    spec2, si2 = nc.stream_generate_kv(
+        m, tok, "p", n_new, ctx, temperature=0.0, top_p=1.0, display=False,
+        print_prompt=False, return_stop_info=True, spec=None,
+        stop_sequences=[ref_text[len(ref_text)//2: len(ref_text)//2 + 4]])
+    check("stop-sequence truncation identical", spec2 == ref2,
+          f"spec={spec2[-40:]!r} ref={ref2[-40:]!r}")
+    check("both report stop_sequence", ri2["reason"] == si2["reason"] == "stop_sequence",
+          f"{ri2['reason']} vs {si2['reason']}")
+
+    # plain model: auto-spec silently falls back to classic
+    mp = make_model(mtp_enabled=False)
+    p3, i3 = nc.stream_generate_kv(
+        mp, tok, "p", 20, len(prompt_ids) + 20, temperature=0.0, top_p=1.0,
+        display=False, print_prompt=False, return_stop_info=True, spec=None)
+    check("no-mtp model: auto falls back to classic (no spec stats)", "spec" not in i3)
+
+
 def t_no_mtp_raises():
     print("plain checkpoint: spec_generate refuses loudly")
     m = make_model(mtp_enabled=False)
@@ -214,7 +266,7 @@ def main():
     print(f"\n=== MTP speculative decoding tests (CPU, torch {torch.__version__}) ===\n")
     for t in (t_greedy_equality, t_greedy_equality_no_swa, t_accept_branch_coverage,
               t_sampled_determinism,
-              t_eos_ledger_truth, t_mtp_cache_lifecycle, t_no_mtp_raises):
+              t_eos_ledger_truth, t_stream_engine_parity, t_mtp_cache_lifecycle, t_no_mtp_raises):
         t()
         print()
     print(f"=== {PASS[0]} passed, {FAIL[0]} failed ===")

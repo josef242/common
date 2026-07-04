@@ -432,6 +432,11 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
 # tool process. Set once after argparse: `nc.ENVELOPE_COMPAT_DEFAULT = args.envelope_compat`.
 ENVELOPE_COMPAT_DEFAULT = False
 
+# Process-wide default for stream_generate_kv's spec= when the caller passes
+# None: None = AUTO (speculative decode on for MTP checkpoints), False = forced
+# classic. Set once after argparse: `if args.no_spec: nc.SPEC_DECODE_DEFAULT = False`.
+SPEC_DECODE_DEFAULT = None
+
 
 def load_model_and_tokenizer(
     checkpoint_path: str,
@@ -833,7 +838,7 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
                        temperature, top_p, display=True, stop_on_eos=False, stop_sequences=None,
                        print_prompt=True, return_stop_info=False,
                        pretty_print=False, role_names=None, cache_state: "CacheState | None" = None,
-                       debug_reuse=False):
+                       debug_reuse=False, spec=None):
     """
     Generates text using KV Caching for O(N) complexity per token.
 
@@ -843,9 +848,25 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
     Args:
         pretty_print: If True, replace special tokens with readable versions when displaying
         role_names: Dict with "assistant" and "user" keys for pretty print names
+        spec: MTP self-speculative decode engine. None (default) = AUTO — on iff
+            the checkpoint carries an MTP module; False = classic single-token
+            decode; True = require spec (raises without an MTP module).
+            The engine is a drop-in: identical features (stop sequences,
+            streaming display, pretty print, reuse), greedy outputs
+            BIT-IDENTICAL to classic; sampled outputs draw from the identical
+            distribution (k=1 speculative sampling is distribution-exact) but
+            consume RNG in a different order, so a fixed torch seed produces a
+            different — equally valid — trajectory than the classic engine.
     """
 
     device = next(model.parameters()).device
+
+    _mtp_mod = getattr(model, 'mtp', None)
+    if spec is None:
+        spec = SPEC_DECODE_DEFAULT   # process-wide override (e.g. a tool's --no_spec flag)
+    if spec is True and _mtp_mod is None:
+        raise ValueError("spec=True requires an MTP checkpoint (model.mtp is None)")
+    use_spec = (_mtp_mod is not None) if spec is None else (bool(spec) and _mtp_mod is not None)
 
     # 1. Prepare Tokens
     tokens = tokenizer.encode(prompt_text, bos=True, eos=False)
@@ -933,6 +954,8 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
         # Decode full prompt to establish baseline length
         last_decoded_full = tokenizer.decode(all_token_ids)
         last_decoded_len = len(last_decoded_full)
+    else:
+        last_decoded_len = 0  # unused off-SPM; defined for the shared emit closure
 
     # materialized_len = number of cache positions [0, materialized_len) that
     # actually hold valid K/V for prompt_ids+generated tokens. Updated only
@@ -979,6 +1002,13 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
             _lc = getattr(model, 'min_rolling_cache_len', lambda: None)()
             if _lc is not None and start_pos < len(ledger) and len(ledger) > _lc:
                 start_pos = 0
+            # Spec engine needs the MTP cache in LOCKSTEP with the reused trunk
+            # prefix (its own attention runs over all past mtp inputs). If a
+            # prior turn ran classic decode (or anything desynced the mtp
+            # cache), degrade to full re-prefill so BOTH caches rebuild
+            # together — slow, never wrong.
+            if use_spec and getattr(model, '_mtp_cache_len', 0) < start_pos:
+                start_pos = 0
             if debug_reuse:
                 # Observability: how much of the prompt was served from cache vs
                 # re-prefilled, AND a hint at WHY reuse was limited this turn:
@@ -1018,9 +1048,210 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
             else:
                 print(prompt_text, end="", flush=True)
 
+        def _sample_stream(next_token_logits):
+            """Classic sampling (global RNG) — shared by both decode engines so
+            temperature/top-p semantics are identical."""
+            if temperature > 0:
+                probs = torch.softmax(next_token_logits / temperature, dim=-1)
+                if top_p < 1.0:
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                    probs[indices_to_remove] = 0
+                    probs = probs / probs.sum()
+                return int(torch.multinomial(probs, num_samples=1))
+            return int(torch.argmax(next_token_logits))
+
+        def _emit_token(next_token_id):
+            """Shared per-token pipeline: record, decode, stream with stop-seq
+            buffering, EOS check. Returns True when generation must stop.
+            Used by BOTH decode engines so classic and spec can never drift —
+            extracted verbatim from the classic loop tail. NOTE: emitting
+            tokens one-at-a-time through this pipeline is also what makes
+            EOS/stop-sequences correct mid-round for the spec engine (an EOS
+            draft stops HERE, before its pair partner is ever surfaced)."""
+            nonlocal generated_text_so_far, print_buffer, stop_sequence_hit
+            nonlocal stop_reason, last_decoded_len
+
+            generated_tokens.append(next_token_id)
+            all_token_ids.append(next_token_id)
+
+            if needs_spm_workaround:
+                decoded_full = tokenizer.decode(all_token_ids)
+                new_text = decoded_full[last_decoded_len:]
+                if new_text:
+                    generated_text_so_far += new_text
+                    print_buffer += new_text
+                    last_decoded_len = len(decoded_full)
+            else:
+                decoded_token = tokenizer.decode([next_token_id])
+                generated_text_so_far += decoded_token
+                print_buffer += decoded_token
+
+            if stop_sequences:
+                for stop_seq in stop_sequences:
+                    if stop_seq in generated_text_so_far:
+                        stop_sequence_hit = stop_seq
+                        generated_text_so_far = generated_text_so_far[:generated_text_so_far.find(stop_seq)]
+                        if stop_seq in print_buffer:
+                            print_buffer = print_buffer[:print_buffer.find(stop_seq)]
+                        break
+                if stop_sequence_hit:
+                    if display and print_buffer:
+                        to_print = print_buffer
+                        if pretty_print and role_names:
+                            to_print = _prettify_special_tokens(to_print, role_names)
+                        print(to_print, end="", flush=True)
+                    stop_reason = {"reason": "stop_sequence", "detail": repr(stop_sequence_hit),
+                                   "tokens_generated": len(generated_tokens)}
+                    return True
+
+            if display and max_stop_len > 0:
+                if len(print_buffer) > max_stop_len:
+                    candidate = print_buffer[:-max_stop_len]
+                    if pretty_print and role_names:
+                        safe_len = _find_safe_print_boundary(candidate)
+                        safe_to_print = candidate[:safe_len]
+                        safe_to_print = _prettify_special_tokens(safe_to_print, role_names)
+                        print_buffer = print_buffer[safe_len:]
+                    else:
+                        safe_to_print = candidate
+                        print_buffer = print_buffer[-max_stop_len:]
+                    if safe_to_print:
+                        print(safe_to_print, end="", flush=True)
+            elif display:
+                to_print = print_buffer
+                if pretty_print and role_names:
+                    to_print = _prettify_special_tokens(to_print, role_names)
+                print(to_print, end="", flush=True)
+                print_buffer = ""
+
+            if stop_on_eos and next_token_id == tokenizer.eos_id:
+                stop_reason = {"reason": "eos", "detail": f"token_id={tokenizer.eos_id}",
+                               "tokens_generated": len(generated_tokens)}
+                return True
+            return False
+
         # 3. Prefill and Generation Loop
         with NonBlockingInput():
-            for i in range(max_new_tokens):
+            if use_spec and max_new_tokens > 0:
+                # ===== SPEC ENGINE (MTP self-speculative decode) =====
+                # Drop-in for the classic loop below: same emit pipeline, same
+                # sampling semantics (greedy bit-identical; sampled
+                # distribution-exact via k=1 speculative sampling). Each round:
+                # ONE trunk forward over [cur, draft] + one tiny MTP pass.
+                spec_rounds = 0
+                spec_accepts = 0
+
+                # trunk suffix prefill (h_pre feeds the MTP backfill)
+                logits, h_pre = model.generate_forward(tokens, start_pos, return_h_pre=True)
+                materialized_len = start_pos + tokens.shape[1]
+                n_ctx = materialized_len
+                cur = _sample_stream(logits[0, -1, :])
+                _stop = _emit_token(cur)
+
+                # MTP backfill over the forwarded suffix -> first draft.
+                # (The reuse guard above forced start_pos=0 whenever the mtp
+                # cache wasn't in lockstep, so [0, start_pos) is covered.)
+                _nt = torch.tensor([suffix_ids[1:] + [cur]], dtype=torch.long, device=device)
+                mtp_logits = model.mtp_decode_chunk(h_pre, _nt, start_pos)
+                model._mtp_cache_len = n_ctx
+                q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
+                draft = int(torch.multinomial(q_probs, 1)) if temperature > 0 else int(q_probs.argmax())
+
+                while not _stop and len(generated_tokens) < max_new_tokens:
+                    if check_for_esc():
+                        if display:
+                            print("\n[Generation interrupted by ESC key]", flush=True)
+                        stop_reason = {"reason": "interrupted", "detail": "ESC key",
+                                       "tokens_generated": len(generated_tokens)}
+                        break
+                    if n_ctx + 2 > total_len:
+                        # one slot left (or none): finish with classic steps —
+                        # emission-count parity with the classic engine
+                        if n_ctx < total_len:
+                            logits, _hp = model.generate_forward(
+                                torch.tensor([[cur]], dtype=torch.long, device=device),
+                                n_ctx, return_h_pre=True)
+                            materialized_len = n_ctx + 1
+                            nxt = _sample_stream(logits[0, -1, :])
+                            _stop = _emit_token(nxt)
+                            n_ctx += 1
+                            cur = nxt
+                            if _stop:
+                                break
+                        stop_reason = {"reason": "context_limit",
+                                       "detail": f"reached {context_size} tokens",
+                                       "tokens_generated": len(generated_tokens)}
+                        break
+
+                    spec_rounds += 1
+                    chunk = torch.tensor([[cur, draft]], dtype=torch.long, device=device)
+                    logits2, h_pre2 = model.generate_forward(chunk, n_ctx, return_h_pre=True)
+                    p1 = _warp_probs(logits2[0, 0].float(), temperature, top_p)
+
+                    if temperature <= 0:
+                        ok = (int(p1.argmax()) == draft)
+                    else:
+                        q_d = float(q_probs[draft])
+                        p_d = float(p1[draft])
+                        ok = (q_d > 0) and (float(torch.rand(())) < min(1.0, p_d / q_d))
+
+                    if ok:
+                        spec_accepts += 1
+                        # BOTH chunk rows are now valid materialized positions
+                        materialized_len = n_ctx + 2
+                        _stop = _emit_token(draft)
+                        if _stop:
+                            n_ctx += 2
+                            break
+                        p2 = _warp_probs(logits2[0, 1].float(), temperature, top_p)
+                        nxt = int(torch.multinomial(p2, 1)) if temperature > 0 else int(p2.argmax())
+                        if len(generated_tokens) < max_new_tokens:
+                            _stop = _emit_token(nxt)
+                        # MTP backfill both rows; last row drafts t_{n_ctx+3}
+                        _nt = torch.tensor([[draft, nxt]], dtype=torch.long, device=device)
+                        mtp_logits = model.mtp_decode_chunk(h_pre2, _nt, n_ctx)
+                        model._mtp_cache_len = n_ctx + 2
+                        q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
+                        draft = int(torch.multinomial(q_probs, 1)) if temperature > 0 else int(q_probs.argmax())
+                        n_ctx += 2
+                        cur = nxt
+                    else:
+                        # row n_ctx+1 holds the REJECTED draft's K/V: claim only
+                        # n_ctx+1 positions (the ledger must never label that
+                        # row; the next round's chunk write overwrites it, and
+                        # in the interim the banded mask excludes its one
+                        # aliased ring slot — review-proven).
+                        materialized_len = n_ctx + 1
+                        resid = torch.clamp(p1 - q_probs, min=0.0)
+                        s = float(resid.sum())
+                        if temperature <= 0:
+                            tok_v = int(p1.argmax())
+                        elif s > 0:
+                            tok_v = int(torch.multinomial(resid / s, 1))
+                        else:
+                            tok_v = int(torch.multinomial(p1, 1))
+                        _stop = _emit_token(tok_v)
+                        # MTP backfill row0 only (rejected row's h_pre is invalid)
+                        _nt = torch.tensor([[tok_v]], dtype=torch.long, device=device)
+                        mtp_logits = model.mtp_decode_chunk(h_pre2[:, :1], _nt, n_ctx)
+                        model._mtp_cache_len = n_ctx + 1
+                        q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
+                        draft = int(torch.multinomial(q_probs, 1)) if temperature > 0 else int(q_probs.argmax())
+                        n_ctx += 1
+                        cur = tok_v
+
+                stop_reason["spec"] = {
+                    "rounds": spec_rounds,
+                    "accepted": spec_accepts,
+                    "acceptance": (spec_accepts / spec_rounds) if spec_rounds else 0.0,
+                }
+
+            for i in range(max_new_tokens if not use_spec else 0):
                 # Check for ESC key press
                 if check_for_esc():
                     if display:
@@ -1065,81 +1296,14 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
 
                 next_token_id = next_token.item()
 
-                # Store the generated token
-                generated_tokens.append(next_token_id)
-                all_token_ids.append(next_token_id)
-
-                # ===== FIXED: Decode and print with SentencePiece workaround =====
-                # Always decode to track generated text (needed for stop sequences)
-                if needs_spm_workaround:
-                    # Decode the FULL sequence to preserve spacing context
-                    decoded_full = tokenizer.decode(all_token_ids)
-                    new_text = decoded_full[last_decoded_len:]
-                    if new_text:
-                        generated_text_so_far += new_text
-                        print_buffer += new_text
-                        last_decoded_len = len(decoded_full)
-                else:
-                    # Non-SentencePiece tokenizers can decode token-by-token
-                    decoded_token = tokenizer.decode([next_token_id])
-                    generated_text_so_far += decoded_token
-                    print_buffer += decoded_token
-
-                # Check for stop sequences
-                if stop_sequences:
-                    for stop_seq in stop_sequences:
-                        if stop_seq in generated_text_so_far:
-                            stop_sequence_hit = stop_seq
-                            # Trim the generated text at the stop sequence
-                            generated_text_so_far = generated_text_so_far[:generated_text_so_far.find(stop_seq)]
-                            # Also trim print buffer - only print up to stop sequence
-                            if stop_seq in print_buffer:
-                                print_buffer = print_buffer[:print_buffer.find(stop_seq)]
-                            break
-                    if stop_sequence_hit:
-                        # Print remaining safe buffer before breaking
-                        if display and print_buffer:
-                            to_print = print_buffer
-                            if pretty_print and role_names:
-                                to_print = _prettify_special_tokens(to_print, role_names)
-                            print(to_print, end="", flush=True)
-                        stop_reason = {"reason": "stop_sequence", "detail": repr(stop_sequence_hit), "tokens_generated": i + 1}
-                        break
-
-                # Buffered printing: only print text that's safe (beyond stop sequence length
-                # and not splitting special tokens when pretty_print is enabled)
-                if display and max_stop_len > 0:
-                    if len(print_buffer) > max_stop_len:
-                        # Determine how much we can safely print
-                        candidate = print_buffer[:-max_stop_len]
-
-                        # If pretty_print is enabled, find safe boundary that doesn't split tokens
-                        if pretty_print and role_names:
-                            safe_len = _find_safe_print_boundary(candidate)
-                            safe_to_print = candidate[:safe_len]
-                            safe_to_print = _prettify_special_tokens(safe_to_print, role_names)
-                            print_buffer = print_buffer[safe_len:]
-                        else:
-                            safe_to_print = candidate
-                            print_buffer = print_buffer[-max_stop_len:]
-
-                        if safe_to_print:
-                            print(safe_to_print, end="", flush=True)
-                elif display:
-                    # No stop sequences, print immediately
-                    to_print = print_buffer
-                    if pretty_print and role_names:
-                        to_print = _prettify_special_tokens(to_print, role_names)
-                    print(to_print, end="", flush=True)
-                    print_buffer = ""
+                # Store, decode, stream, stop-check — the shared emit pipeline
+                _stop = _emit_token(next_token_id)
 
                 # Update for next iteration
                 start_pos += tokens.shape[1]
                 tokens = next_token.unsqueeze(0)
 
-                # Stop condition
-                if stop_on_eos and next_token_id == tokenizer.eos_id:
-                    stop_reason = {"reason": "eos", "detail": f"token_id={tokenizer.eos_id}", "tokens_generated": i + 1}
+                if _stop:
                     break
 
         # Print any remaining buffer (if we didn't hit a stop sequence)

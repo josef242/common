@@ -1772,6 +1772,11 @@ class Transformer(nn.Module):
         else:
             self.mtp = None
         self._last_mtp_loss = None
+        # Speculative decoding: number of positions materialized in the MTP
+        # block's KV cache (maintained by the spec decode path; the trunk
+        # ledger alone can't tell whether the mtp cache is in lockstep —
+        # e.g. after a classic-decode turn on the same cache).
+        self._mtp_cache_len = 0
 
         self.last_loss = None
 
@@ -2065,6 +2070,8 @@ class Transformer(nn.Module):
                     _copy = min(old_len, _old.shape[1], max_seq_len)
                     new_k[:, :_copy] = _old[:, :_copy]
                     new_v[:, :_copy] = _att.cache_v[:, :_copy]
+                else:
+                    self._mtp_cache_len = 0  # fresh mtp cache: nothing materialized
                 _att.cache_k = new_k
                 _att.cache_v = new_v
 
@@ -2100,6 +2107,7 @@ class Transformer(nn.Module):
         if getattr(self, 'mtp', None) is not None:
             self.mtp.block.attention.cache_k = None
             self.mtp.block.attention.cache_v = None
+        self._mtp_cache_len = 0
         self._cache_bsz = None
         self._cache_msl = None
 
