@@ -723,6 +723,13 @@ class CacheState:
     in the KV cache), so `reusable` defaults to FALSE — the caller must
     explicitly opt in only for a verified pure-attention checkpoint.
 
+    SWA rolling rings (swa_enabled checkpoints): reuse is APPEND-ONLY once
+    more tokens than the smallest ring (min_rolling_cache_len()) have been
+    materialized — evicted positions' slots hold FUTURE-position K/V, so
+    REWIND re-entry (/rep truncation, history edits) behind the high-water
+    mark is unsound after wrap. The generate paths guard this by degrading a
+    post-wrap rewind to a full re-prefill (slow, never wrong).
+
     NOTE: this object holds ONLY policy (`reusable`). The actual record of
     which token IDs are materialized in the cache lives on the MODEL
     (`model.get_cache_ledger()` / `set_cache_ledger()` / `reset_cache_ledger()`),
@@ -886,6 +893,16 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
             # Leave >=1 token to forward (need fresh logits to sample from;
             # also handles new-prompt-is-strict-prefix, e.g. /rep truncation).
             start_pos = min(prefix_len, prompt_len - 1)
+            # SWA rolling rings: REWIND re-entry (start_pos behind the ledger's
+            # high-water mark) is UNSOUND once any ring has wrapped — slots for
+            # evicted positions hold FUTURE-position K/V (RoPE-baked), so both
+            # cached paths silently attend the wrong timeline (measured 7e-2
+            # logit corruption). Append-only reuse stays sound at any length;
+            # unwrapped rings (ledger <= smallest ring) remain rewind-safe.
+            # Degrade to full re-prefill: slow, never wrong.
+            _lc = getattr(model, 'min_rolling_cache_len', lambda: None)()
+            if _lc is not None and start_pos < len(ledger) and len(ledger) > _lc:
+                start_pos = 0
             if debug_reuse:
                 # Observability: how much of the prompt was served from cache vs
                 # re-prefilled, AND a hint at WHY reuse was limited this turn:
@@ -1163,6 +1180,10 @@ def verify_kv_reuse_parity(model, tokenizer, context_size,
                     ledger = model.get_cache_ledger()
                     p = _longest_common_prefix_len(ledger, ids)
                     start_pos = min(p, prompt_len - 1)
+                    # mirror stream_generate_kv's SWA rolling-ring rewind guard
+                    _lc = getattr(model, 'min_rolling_cache_len', lambda: None)()
+                    if _lc is not None and start_pos < len(ledger) and len(ledger) > _lc:
+                        start_pos = 0
                 else:
                     model.setup_caches(max_batch_size=bsz, max_seq_len=total_len, force=True)
                     start_pos = 0

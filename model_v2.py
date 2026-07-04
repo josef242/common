@@ -2112,6 +2112,21 @@ class Transformer(nn.Module):
                 return layer.attention.cache_k is not None
         return False  # all layers are GDN
 
+    def min_rolling_cache_len(self):
+        """Smallest live SWA ring capacity, or None when no rolling caches exist.
+
+        The cross-turn prefix-reuse contract is APPEND-ONLY once more tokens
+        than this have been materialized: a wrapped ring's slots for evicted
+        positions hold FUTURE-position K/V, so rewind re-entry behind the
+        ledger's high-water mark would silently attend the wrong timeline.
+        Callers (stream_generate_kv / verify_kv_reuse_parity) degrade a
+        post-wrap rewind to a full re-prefill."""
+        lens = [l.attention.cache_k.shape[1] for l in self.layers
+                if not getattr(l, 'use_gdn', False)
+                and l.attention.cache_window is not None
+                and l.attention.cache_k is not None]
+        return min(lens) if lens else None
+
     def cache_capacity(self):
         """Return (max_batch_size, max_seq_len) of the currently allocated KV
         cache, or (None, None) if no cache is allocated.
