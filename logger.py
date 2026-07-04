@@ -76,10 +76,16 @@ class Logger:
     def print_and_log(self, msg, r0_only=True, log_file=None, silent=False):
         if r0_only and self.rank != 0:
             return
-        
+
         if self._server is None and self._client_thr is None and self.rank == 0:
-            # means set_rank() never ran
-            raise RuntimeError("Logger used before set_rank() was called.")
+            # set_rank() hasn't run yet — e.g. config-validation warnings emitted
+            # during Settings construction (before distributed init). Don't crash;
+            # the file/server routing doesn't exist yet, so fall back to a plain
+            # print. All N processes still read self.rank == 0 here, so honor
+            # r0_only via torchrun's RANK env to avoid N-way duplicate lines.
+            if not silent and not (r0_only and os.environ.get('RANK', '0') != '0'):
+                print(f"{_now()} | {msg}")
+            return
 
         if log_file is None:
             log_file = self.default_logfile
