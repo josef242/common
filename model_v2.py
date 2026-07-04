@@ -622,6 +622,10 @@ class Attention(nn.Module):
         # These are NOT nn.Parameters, just plain tensors when allocated
         self.cache_k: Optional[torch.Tensor] = None
         self.cache_v: Optional[torch.Tensor] = None
+        # SWA rolling cache: set by Transformer.setup_caches — the window size W
+        # for LOCAL layers (cache holds min(max_seq_len, W) slots, slot = pos % Lc),
+        # None for global layers (full-length cache, original semantics).
+        self.cache_window: Optional[int] = None
 
     def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor,
                 block_mask=None):
@@ -791,44 +795,99 @@ class Attention(nn.Module):
                 xq = xq * scale
                 xk = xk * scale
 
-        # ➎ Update KV cache        
+        # ➎ Update KV cache + select keys/values for this call
         assert self.cache_k is not None, "Must call setup_caches() before forward_with_cache()"
-        self.cache_k[:bsz, start_pos:start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos:start_pos + seqlen] = xv
-        
-        # Retrieve all cached K/V up to current position
-        keys = self.cache_k[:bsz, :start_pos + seqlen]
-        values = self.cache_v[:bsz, :start_pos + seqlen]
+        if self.cache_window is None:
+            # ---- GLOBAL layer: full-length cache (original path, byte-identical) ----
+            self.cache_k[:bsz, start_pos:start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos:start_pos + seqlen] = xv
+
+            # Retrieve all cached K/V up to current position
+            keys = self.cache_k[:bsz, :start_pos + seqlen]
+            values = self.cache_v[:bsz, :start_pos + seqlen]
+
+            # For single-token decode (seqlen == 1) we attend to all past keys,
+            # no mask. For prefill (seqlen > 1) we need a causal mask.
+            #
+            # IMPORTANT: query positions are [start_pos, start_pos+seqlen) but key
+            # positions are [0, start_pos+seqlen) — a NON-SQUARE score matrix when
+            # start_pos > 0 (cross-turn prefix reuse prefills only the suffix). SDPA's
+            # is_causal=True applies a TOP-LEFT-aligned square mask, which is only
+            # correct when start_pos == 0. For start_pos > 0 it would let suffix query
+            # i attend to keys [0, i] instead of the correct [0, start_pos+i] — silent
+            # wrong output. So: use is_causal=True ONLY for the start_pos == 0 prefill,
+            # and build an explicit absolute-position-aligned mask otherwise.
+            need_mask = (seqlen > 1)
+            use_is_causal = need_mask and (start_pos == 0)
+            attn_mask = None
+            if need_mask and not use_is_causal:
+                # Bottom-right / absolute-aligned causal mask: query row r (absolute
+                # position start_pos+r) may attend to key cols <= start_pos+r.
+                total_len = start_pos + seqlen
+                attn_mask = torch.triu(
+                    torch.full((seqlen, total_len), float("-inf"), device=x.device, dtype=xq.dtype),
+                    diagonal=start_pos + 1,
+                )
+        else:
+            # ---- LOCAL (SWA) layer: ROLLING WINDOW cache — slot(q) = q % Lc.
+            # RoPE (and any qk-norm) is baked into cached keys, so attention is
+            # over a SET: slot ORDER is irrelevant wherever no mask is needed.
+            # Memory: Lc = min(max_seq_len, W) slots instead of max_seq_len —
+            # and long-context decode attends ≤ W keys instead of the full
+            # history (training-faithful semantics AND faster).
+            if not self.use_sdp:
+                raise RuntimeError("SWA rolling cache requires the SDPA path (torch>=2.0)")
+            W = self.cache_window
+            Lc = self.cache_k.shape[1]
+            total = start_pos + seqlen
+            need_mask = False
+            use_is_causal = False
+            attn_mask = None
+            if seqlen == 1:
+                # decode fast path: ring-write one slot, attend every valid slot,
+                # NO mask ever — post-write the ring holds exactly positions
+                # [max(0, total-Lc), total), all causal and all in-window (Lc==W).
+                slot = start_pos % Lc
+                self.cache_k[:bsz, slot] = xk[:, 0]
+                self.cache_v[:bsz, slot] = xv[:, 0]
+                n_valid = min(total, Lc)
+                keys = self.cache_k[:bsz, :n_valid]
+                values = self.cache_v[:bsz, :n_valid]
+            else:
+                # chunk path (prefill or cross-turn suffix): GATHER the previous
+                # window in POSITIONAL order BEFORE writing (the chunk write may
+                # evict slots the earliest chunk queries still need), then attend
+                # [prev_window, chunk] under a banded causal∧window mask built on
+                # absolute positions.
+                n_prev = min(start_pos, Lc)
+                if n_prev > 0:
+                    ppos = torch.arange(start_pos - n_prev, start_pos, device=x.device)
+                    keys = torch.cat([self.cache_k[:bsz, ppos % Lc], xk], dim=1)
+                    values = torch.cat([self.cache_v[:bsz, ppos % Lc], xv], dim=1)
+                else:
+                    keys, values = xk, xv
+                # ring-write the chunk tail (only the last min(S, Lc) positions can
+                # survive; consecutive positions mod Lc are unique, so no in-write
+                # slot collisions)
+                tail = min(seqlen, Lc)
+                wpos = torch.arange(total - tail, total, device=x.device)
+                self.cache_k[:bsz, wpos % Lc] = xk[:, -tail:]
+                self.cache_v[:bsz, wpos % Lc] = xv[:, -tail:]
+                # banded mask: key positions are CONTIGUOUS [start_pos-n_prev, total);
+                # query p attends key q iff q <= p AND q > p - W.
+                kpos = torch.arange(start_pos - n_prev, total, device=x.device)
+                qpos = torch.arange(start_pos, total, device=x.device)
+                allowed = (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] > qpos[:, None] - W)
+                attn_mask = torch.zeros((seqlen, kpos.shape[0]), device=x.device, dtype=xq.dtype)
+                attn_mask.masked_fill_(~allowed, float("-inf"))
+                need_mask = True
 
         # (keys are already normalized/scaled in-cache for after_rope modes)
 
         # ➐ Attention (no dropout during inference)
         xq = xq.transpose(1, 2)       # [B, Hq, S_q, D]
         k = keys.transpose(1, 2)      # [B, Hkv, S_kv, D]
-        v = values.transpose(1, 2)        
-
-        # For single-token decode (seqlen == 1) we attend to all past keys, no mask.
-        # For prefill (seqlen > 1) we need a causal mask.
-        #
-        # IMPORTANT: query positions are [start_pos, start_pos+seqlen) but key
-        # positions are [0, start_pos+seqlen) — a NON-SQUARE score matrix when
-        # start_pos > 0 (cross-turn prefix reuse prefills only the suffix). SDPA's
-        # is_causal=True applies a TOP-LEFT-aligned square mask, which is only
-        # correct when start_pos == 0. For start_pos > 0 it would let suffix query
-        # i attend to keys [0, i] instead of the correct [0, start_pos+i] — silent
-        # wrong output. So: use is_causal=True ONLY for the start_pos == 0 prefill,
-        # and build an explicit absolute-position-aligned mask otherwise.
-        need_mask = (seqlen > 1)
-        use_is_causal = need_mask and (start_pos == 0)
-        attn_mask = None
-        if need_mask and not use_is_causal:
-            # Bottom-right / absolute-aligned causal mask: query row r (absolute
-            # position start_pos+r) may attend to key cols <= start_pos+r.
-            total_len = start_pos + seqlen
-            attn_mask = torch.triu(
-                torch.full((seqlen, total_len), float("-inf"), device=x.device, dtype=xq.dtype),
-                diagonal=start_pos + 1,
-            )
+        v = values.transpose(1, 2)
 
         if self.use_sdp:
             if self.n_rep > 1 and self.sdp_enable_gqa:
@@ -1900,12 +1959,10 @@ class Transformer(nn.Module):
                 f"would silently misalign RoPE. Reduce context_size to "
                 f"<= {trained_max}."
             )
-        if getattr(self.params, 'swa_enabled', False) and max_seq_len > self.params.swa_window:
-            print(f"[swa] WARNING: cache length {max_seq_len} > swa_window "
-                  f"({self.params.swa_window}) — forward_with_cache attends the FULL cache "
-                  f"(no rolling window implemented), so sampling matches training semantics "
-                  f"only while the total sequence stays <= swa_window. Longer generations "
-                  f"give local layers out-of-distribution context.")
+        # SWA note: local layers use ROLLING WINDOW caches (min(max_seq_len, W)
+        # slots) — long generation is training-faithful (windowed) at any length,
+        # and local-layer decode cost is bounded by W. See the per-layer sizing
+        # in the allocation loop below.
 
         n_kv_heads = self.params.n_heads if self.params.n_kv_heads is None else self.params.n_kv_heads
         head_dim = self.params.dim // self.params.n_heads
@@ -1947,6 +2004,8 @@ class Transformer(nn.Module):
                 can_preserve = True
                 old_len = cur_len
 
+        _swa_on = getattr(self.params, 'swa_enabled', False)
+        _swa_W = int(getattr(self.params, 'swa_window', 0)) if _swa_on else None
         for layer in self.layers:
             if getattr(layer, 'use_gdn', False):
                 continue  # GDN layers have no KV cache
@@ -1954,22 +2013,44 @@ class Transformer(nn.Module):
             device = layer.attention.wq.weight.device
             dtype = layer.attention.wq.weight.dtype
 
+            # SWA rolling cache: LOCAL layers hold min(max_seq_len, W) slots
+            # (slot = pos % Lc); global layers keep the full length. This cuts
+            # KV memory to ~1/3 on the wizard-era hybrids AND makes long
+            # generation training-faithful (windowed) instead of full-cache OOD.
+            _local = _swa_on and getattr(layer, 'swa_local', False)
+            layer.attention.cache_window = _swa_W if _local else None
+            len_l = min(max_seq_len, _swa_W) if _local else max_seq_len
+
+            old_k = layer.attention.cache_k
+            if can_preserve and old_k is not None and old_k.shape[1] == len_l:
+                # same per-layer size (e.g. a LOCAL ring at W while max_seq_len
+                # grows): slot = pos % Lc is invariant to max_seq_len, so the
+                # buffer stays valid as-is.
+                continue
+
             new_k = torch.zeros(
-                (max_batch_size, max_seq_len, n_kv_heads, head_dim),
+                (max_batch_size, len_l, n_kv_heads, head_dim),
                 device=device, dtype=dtype
             )
             new_v = torch.zeros(
-                (max_batch_size, max_seq_len, n_kv_heads, head_dim),
+                (max_batch_size, len_l, n_kv_heads, head_dim),
                 device=device, dtype=dtype
             )
-            if can_preserve:
-                # Copy the still-valid prefix K/V into the larger buffer.
-                old_k = layer.attention.cache_k
-                old_v = layer.attention.cache_v
-                new_k[:, :old_len] = old_k[:, :old_len]
-                new_v[:, :old_len] = old_v[:, :old_len]
+            if can_preserve and old_k is not None:
+                # Growing this layer's buffer: copy the still-valid prefix. For a
+                # LOCAL layer this only happens when the old length was < W, i.e.
+                # the ring never wrapped (tokens <= old max_seq_len < W), so
+                # slot == pos and a prefix copy is exact.
+                _copy = min(old_len, old_k.shape[1], len_l)
+                new_k[:, :_copy] = old_k[:, :_copy]
+                new_v[:, :_copy] = layer.attention.cache_v[:, :_copy]
             layer.attention.cache_k = new_k
             layer.attention.cache_v = new_v
+
+        # Capacity bookkeeping: with per-layer lengths, probing layer 0 (LOCAL
+        # under SWA -> W slots) would misreport; store the logical capacity.
+        self._cache_bsz = max_batch_size
+        self._cache_msl = max_seq_len
 
         if can_preserve:
             # Contents [0, old_len) carried over → the ledger still describes
@@ -1995,6 +2076,8 @@ class Transformer(nn.Module):
                 del layer.attention.cache_v
             layer.attention.cache_k = None
             layer.attention.cache_v = None
+        self._cache_bsz = None
+        self._cache_msl = None
 
         # The cache no longer exists → its token ledger is meaningless.
         self.reset_cache_ledger()
@@ -2033,8 +2116,12 @@ class Transformer(nn.Module):
         """Return (max_batch_size, max_seq_len) of the currently allocated KV
         cache, or (None, None) if no cache is allocated.
 
-        Reads the first non-GDN layer's cache_k shape: [bsz, seq_len, n_kv, hd].
-        """
+        Uses the stored logical capacity when available (with SWA rolling
+        caches, per-layer buffer lengths differ — probing layer 0, which is
+        LOCAL under SWA, would misreport W as the capacity). Falls back to
+        probing the first non-GDN layer for pre-SWA cache states."""
+        if getattr(self, '_cache_msl', None) is not None and self.has_caches():
+            return self._cache_bsz, self._cache_msl
         for layer in self.layers:
             if getattr(layer, 'use_gdn', False):
                 continue
