@@ -1193,12 +1193,8 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
                     logits2, h_pre2 = model.generate_forward(chunk, n_ctx, return_h_pre=True)
                     p1 = _warp_probs(logits2[0, 0].float(), temperature, top_p)
 
-                    if temperature <= 0:
-                        ok = (int(p1.argmax()) == draft)
-                    else:
-                        q_d = float(q_probs[draft])
-                        p_d = float(p1[draft])
-                        ok = (q_d > 0) and (float(torch.rand(())) < min(1.0, p_d / q_d))
+                    # k=1 speculative-sampling verification (shared with spec_generate)
+                    ok, reject_tok = _spec_verify_step(p1, q_probs, draft, temperature)
 
                     if ok:
                         spec_accepts += 1
@@ -1227,14 +1223,7 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
                         # in the interim the banded mask excludes its one
                         # aliased ring slot — review-proven).
                         materialized_len = n_ctx + 1
-                        resid = torch.clamp(p1 - q_probs, min=0.0)
-                        s = float(resid.sum())
-                        if temperature <= 0:
-                            tok_v = int(p1.argmax())
-                        elif s > 0:
-                            tok_v = int(torch.multinomial(resid / s, 1))
-                        else:
-                            tok_v = int(torch.multinomial(p1, 1))
+                        tok_v = reject_tok   # residual sample from _spec_verify_step
                         _stop = _emit_token(tok_v)
                         # MTP backfill row0 only (rejected row's h_pre is invalid)
                         _nt = torch.tensor([[tok_v]], dtype=torch.long, device=device)
@@ -1518,6 +1507,40 @@ def _warp_probs(logits: torch.Tensor, temperature: float, top_p: float) -> torch
     return probs
 
 
+def _spec_verify_step(p1, q_probs, draft, temperature, generator=None):
+    """k=1 speculative-sampling verification of ONE draft token — the SINGLE
+    SOURCE OF TRUTH shared by spec_generate and stream_generate_kv's inlined
+    engine (extracted so the two can never drift on this safety-critical math).
+
+    Given the target distribution p1 (warped trunk logits at the verified
+    position) and the draft distribution q_probs (warped MTP logits) that
+    `draft` was sampled from, returns (accept, emit):
+        accept=True,  emit=None  -> caller emits `draft`;
+        accept=False, emit=tok   -> caller emits `tok`, a residual draw from
+                                    normalize(max(0, p1 - q_probs)).
+    The accept/residual pair makes the emitted-token distribution EXACTLY p1 for
+    ANY draft law q_probs — the speculative-sampling guarantee (Leviathan et al.
+    2023; Chen et al. 2023). temperature<=0 degrades to greedy verification
+    (p1, q_probs are one-hot): accept iff draft==argmax(p1), else emit
+    argmax(p1) — bit-exact greedy.
+
+    RNG is consumed in the SAME order as ordinary sampling — at most one uniform
+    (the accept Bernoulli) then one categorical (only on reject) — so seeded
+    trajectories are identical whether or not this is factored out."""
+    if temperature <= 0:
+        am = int(p1.argmax())
+        return (am == draft), (None if am == draft else am)
+    q_d = float(q_probs[draft])
+    p_d = float(p1[draft])
+    r = float(torch.rand((), generator=generator, device=p1.device))
+    if q_d > 0 and r < min(1.0, p_d / q_d):
+        return True, None
+    resid = torch.clamp(p1 - q_probs, min=0.0)
+    s = float(resid.sum())
+    probs = resid / s if s > 0 else p1
+    return False, int(torch.multinomial(probs, 1, generator=generator))
+
+
 def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
                   temperature=0.0, top_p=1.0, stop_on_eos=False, seed=None,
                   prompt_ids=None, on_token=None):
@@ -1602,14 +1625,9 @@ def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
             logits2, h_pre2 = model.generate_forward(chunk, n_ctx, return_h_pre=True)
             p1 = _warp_probs(logits2[0, 0].float(), temperature, top_p)
 
-            # k=1 speculative-sampling verification
-            q_d = float(q_probs[draft])
-            p_d = float(p1[draft])
-            if temperature <= 0:
-                ok = (int(p1.argmax()) == draft)
-            else:
-                r = torch.rand((), generator=generator, device=device).item()
-                ok = (q_d > 0) and (r < min(1.0, p_d / q_d))
+            # k=1 speculative-sampling verification (shared with the stream engine)
+            ok, reject_tok = _spec_verify_step(p1, q_probs, draft, temperature,
+                                               generator=generator)
 
             if ok:
                 accepted += 1
@@ -1651,10 +1669,8 @@ def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
                 draft = draft_new
             else:
                 accept_bits.append(0)
-                # residual sampling keeps the output distribution exact
-                resid = torch.clamp(p1 - q_probs, min=0.0)
-                s = float(resid.sum())
-                tok_v = _sample(resid / s) if s > 0 else _sample(p1)
+                # residual sample (from _spec_verify_step) keeps the output exact
+                tok_v = reject_tok
                 emitted.append(tok_v)
                 if on_token: on_token(tok_v)
                 # trunk position n_ctx+1 holds the REJECTED draft's K/V — the next

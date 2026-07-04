@@ -37,6 +37,18 @@ class StubTok:
     def decode(self, ids): return "".join(f"<{i}>" for i in ids)
 
 
+class StubTokEnc(StubTok):
+    """StubTok whose encode() returns a settable id list — for driving
+    stream_generate_kv (which encodes prompt_text) with controlled tokens.
+    set_ids() lets a multi-turn harness re-encode the growing stream each turn."""
+    def __init__(self, ids):
+        self._ids = list(ids)
+    def set_ids(self, ids):
+        self._ids = list(ids)
+    def encode(self, text, bos=True, eos=False):
+        return list(self._ids)
+
+
 def make_model(vocab=16, **over):
     kw = dict(dim=64, n_layers=4, n_heads=4, n_kv_heads=2, vocab_size=vocab,
               max_seq_len=256, dropout=0.0, qk_norm_mode="before_rope",
@@ -62,6 +74,31 @@ def vanilla_greedy(model, prompt_ids, n_new):
             logits = model.generate_forward(
                 torch.tensor([[out[-1]]], dtype=torch.long), pos)
             out.append(int(logits[0, -1].argmax()))
+            pos += 1
+    model.clear_caches()
+    return out
+
+
+def vanilla_sample(model, prompt_ids, n_new, temperature, top_p, generator):
+    """Direct (warped) sampling from the trunk — the GROUND-TRUTH distribution
+    the spec engine must reproduce. Every token is drawn directly from p (the
+    warped trunk distribution); no draft/verify. Uses nc._warp_probs so the
+    warp is byte-identical to what spec_generate applies, isolating the ONLY
+    difference to draft/verify-vs-direct."""
+    total = len(prompt_ids) + n_new
+    model.setup_caches(max_batch_size=1, max_seq_len=total, force=True)
+    out = []
+    with torch.no_grad():
+        toks = torch.tensor([prompt_ids], dtype=torch.long)
+        logits = model.generate_forward(toks, 0)
+        p = nc._warp_probs(logits[0, -1].float(), temperature, top_p)
+        out.append(int(torch.multinomial(p, 1, generator=generator)))
+        pos = len(prompt_ids)
+        while len(out) < n_new:
+            logits = model.generate_forward(
+                torch.tensor([[out[-1]]], dtype=torch.long), pos)
+            p = nc._warp_probs(logits[0, -1].float(), temperature, top_p)
+            out.append(int(torch.multinomial(p, 1, generator=generator)))
             pos += 1
     model.clear_caches()
     return out
@@ -190,6 +227,186 @@ def t_eos_ledger_truth():
           f"eos_stops={eos_stops}/30")
 
 
+def t_spec_verify_primitive():
+    print("accept/reject PRIMITIVE (_spec_verify_step, the SINGLE source of truth for")
+    print("both engines): emitted-token law == p1 for ANY draft law q — tested with q")
+    print("chosen ADVERSARIALLY far from p, where the residual/reject path carries the")
+    print("mass. (Untrained p~=q can't stress this; that is why the integration")
+    print("differential below has little to see — the POWER lives HERE.)")
+    V = 6
+    M = 300_000
+
+    def tvd(a, b):
+        return 0.5 * float((a - b).abs().sum())
+
+    def emitted_law(p1, q, seed):
+        """Empirical distribution of the token _spec_verify_step emits, over M
+        draws of (draft ~ q, then verify). Must equal p1 if the primitive is
+        exact — for ANY q."""
+        g = torch.Generator()
+        g.manual_seed(seed)
+        c = torch.zeros(V)
+        for _ in range(M):
+            draft = int(torch.multinomial(q, 1, generator=g))
+            acc, emit = nc._spec_verify_step(p1, q, draft, 1.0, generator=g)
+            c[draft if acc else emit] += 1
+        return c / M
+
+    cases = [
+        ("p peaked / q anti-peaked", [.60, .20, .10, .05, .03, .02], [.02, .03, .05, .10, .20, .60]),
+        ("p uniform  / q peaked",    [1/6]*6,                        [.70, .10, .08, .06, .04, .02]),
+        ("near-disjoint support",    [.45, .45, .05, .03, .01, .01], [.01, .01, .03, .05, .45, .45]),
+    ]
+    noise = (V / M) ** 0.5     # ~0.004: MC floor a CORRECT sampler reaches
+    worst = 0.0
+    for name, pl, ql in cases:
+        p1 = torch.tensor(pl); p1 = p1 / p1.sum()
+        q = torch.tensor(ql); q = q / q.sum()
+        d = emitted_law(p1, q, 4242)
+        e = tvd(d, p1)
+        worst = max(worst, e)
+        e_acc = float(torch.minimum(p1, q).sum())   # expected accept rate = sum min(p,q)
+        print(f"       {name:<26} TVD(emit,p1)={e:.4f}  E[accept]={e_acc:.2f}  "
+              f"TVD(q,p1)={tvd(q, p1):.2f}")
+        check(f"[{name}] emitted law == p1 (divergent q, {100*(1-e_acc):.0f}% reject)",
+              e < 0.01, f"TVD={e:.4f} (MC floor ~{noise:.4f})")
+        # SELF-WITNESSING POWER: the naive/broken 'always accept' emits ~q, whose
+        # TVD from p1 is huge here — so clearing the <0.01 bound is something only
+        # a CORRECT accept/reject+residual sampler can do (a mutated one lands near
+        # TVD(q,p1), far above the bound). No transcribed mutation needed.
+        check(f"[{name}] bound is meaningful (broken sampler ~q would fail it)",
+              tvd(q, p1) > 0.05)
+    check("primitive exact across all adversarial (p,q)", worst < 0.01, f"worst={worst:.4f}")
+
+
+def t_sampled_distribution_equivalence():
+    print("SAMPLED mode INTEGRATION: the real engine feeds p (trunk) and q (MTP) into")
+    print("the verified primitive and plumbs the result — end-to-end output law must")
+    print("match direct sampling. (Formula POWER is proven by t_spec_verify_primitive;")
+    print("this + greedy bit-identity confirm the PLUMBING.) Differential, self-calibrated.")
+    V = 6
+    m = make_model(vocab=V)
+    prompt = [5, 3, 1, 4, 2]
+    T, P = 1.0, 1.0            # top_p=1.0 isolates accept/reject from nucleus edges
+    N = 2500                   # smoke-scale: the primitive test carries the power
+
+    def joint(sampler, seed_base):
+        """Empirical joint distribution of (tok0, tok1) over N independent draws.
+        tok0 is direct-sampled in BOTH engines; tok1 is the FIRST speculative
+        decision (accept a q-draft w.p. min(1,p/q), else residual) — so any
+        p/q-misalignment or residual bug shows up here and nowhere in greedy."""
+        C = torch.zeros(V, V)
+        for s in range(N):
+            ids = sampler(seed_base + s)
+            C[ids[0], ids[1]] += 1
+        return C / C.sum()
+
+    def draw_direct(seed):
+        g = torch.Generator()
+        g.manual_seed(seed)
+        return vanilla_sample(m, prompt, 2, T, P, g)
+
+    def draw_spec(seed):
+        return nc.spec_generate(m, StubTok(), None, 2, len(prompt) + 2,
+                                temperature=T, top_p=P, seed=seed,
+                                prompt_ids=prompt)["token_ids"]
+
+    # Disjoint seed ranges so no run is shared between the three empirical joints.
+    D_a = joint(draw_direct, 1)            # direct sampling, batch A
+    D_b = joint(draw_direct, 1 + N)        # direct sampling, batch B -> NULL noise
+    S   = joint(draw_spec, 1 + 2 * N)      # spec engine
+
+    def tvd(a, b):
+        return 0.5 * float((a - b).abs().sum())
+
+    null = tvd(D_a, D_b)                    # direct-vs-direct: pure sampling noise
+    test = tvd(D_a, S)                      # spec-vs-direct
+    m_null = tvd(D_a.sum(0), D_b.sum(0))    # tok1 marginal (V cells: high power)
+    m_test = tvd(D_a.sum(0), S.sum(0))
+    print(f"       joint  TVD  spec-vs-direct={test:.4f}   null direct-vs-direct={null:.4f}")
+    print(f"       tok1   TVD  spec-vs-direct={m_test:.4f}   null direct-vs-direct={m_null:.4f}")
+    # If spec's distribution == direct's, `test` is two independent N-estimates
+    # of the SAME law, so E[test]≈E[null]; 2*null+0.01 covers fluctuation while a
+    # genuine bias (which grows with the error, not the noise) blows past it.
+    check("joint (tok0,tok1) distribution matches within null noise",
+          test <= 2 * null + 0.01, f"test={test:.4f} null={null:.4f}")
+    check("tok1 marginal distribution matches within null noise",
+          m_test <= 2 * m_null + 0.01, f"test={m_test:.4f} null={m_null:.4f}")
+    # guard against a vacuous pass: confirm accept AND reject both actually fired
+    r = nc.spec_generate(m, StubTok(), None, 24, len(prompt) + 24, temperature=T,
+                         top_p=P, seed=42, prompt_ids=prompt)
+    bits = r["accept_bits"]
+    check("accept/reject path exercised (both branches present)",
+          0 in bits and 1 in bits, f"acceptance={r['acceptance_rate']:.2f}")
+
+    # cross-implementation: the INLINED stream engine and standalone spec_generate
+    # share the accept/reject math but are separate code — their (tok0,tok1)
+    # joints must agree too (differential between the two spec implementations).
+    import re as _re
+    def draw_stream_spec(seed):
+        torch.manual_seed(seed)   # stream engine uses global RNG
+        txt = nc.stream_generate_kv(m, StubTokEnc(prompt), "p", 2, len(prompt) + 2,
+                                    temperature=T, top_p=P, display=False,
+                                    print_prompt=False, spec=None)
+        return [int(x) for x in _re.findall(r'<(\d+)>', txt)][:2]
+    Nc = 2500
+    Csg = torch.zeros(V, V)
+    Cst = torch.zeros(V, V)
+    for s in range(Nc):
+        a = draw_spec(7_000_000 + s)
+        b = draw_stream_spec(9_000_000 + s)
+        Csg[a[0], a[1]] += 1
+        Cst[b[0], b[1]] += 1
+    Csg /= Csg.sum(); Cst /= Cst.sum()
+    xtest = tvd(Csg, Cst)
+    # both are N=2500 estimates of the (claimed) same law -> expect ~sqrt(2) larger
+    # per-cell noise than the N=5000 null; bound generously.
+    print(f"       joint  TVD  standalone-vs-stream spec={xtest:.4f}")
+    check("standalone spec_generate == inlined stream engine (distribution)",
+          xtest <= 3 * null + 0.02, f"xtest={xtest:.4f} null={null:.4f}")
+
+
+def t_spec_reuse_equivalence():
+    print("cross-turn KV reuse: multi-turn spec decode WITH reuse == a no-reuse")
+    print("spec decode over the concatenated stream (greedy -> bit-exact). Drives")
+    print("the spec engine's materialized_len (+2/+1) and _mtp_cache_len lockstep")
+    print("bookkeeping, INCLUDING a spec->classic->spec turn sequence (the")
+    print("stale-_mtp_cache_len path the integration review flagged).")
+    import re as _re
+
+    def parse_ids(txt):
+        return [int(x) for x in _re.findall(r'<(\d+)>', txt)]
+
+    def run_turns(m, base, per_turn, n_turns, ctx, reuse, spec_per_turn):
+        m.clear_caches()
+        tok = StubTokEnc(base)
+        state = nc.CacheState(reusable=True) if reuse else None
+        stream = list(base)
+        for t in range(n_turns):
+            tok.set_ids(stream)          # each turn re-encodes the FULL stream so far
+            txt = nc.stream_generate_kv(
+                m, tok, "p", per_turn, ctx, temperature=0.0, top_p=1.0,
+                display=False, print_prompt=False, cache_state=state,
+                spec=spec_per_turn[t])
+            stream += parse_ids(txt)
+        m.clear_caches()
+        return stream
+
+    for label, kw in [("non-SWA (isolates spec bookkeeping)",
+                       dict(swa_enabled=False, doc_attn_mask=False, doc_pos_reset=False)),
+                      ("full-stack SWA", dict())]:
+        m = make_model(**kw)
+        base = [5, 7, 9, 11, 6, 8, 10, 12]
+        pt, nt, ctx = 5, 3, 96
+        ref = run_turns(m, base, pt, nt, ctx, reuse=False, spec_per_turn=[None] * nt)
+        reu = run_turns(m, base, pt, nt, ctx, reuse=True, spec_per_turn=[None] * nt)
+        mix = run_turns(m, base, pt, nt, ctx, reuse=True, spec_per_turn=[None, False, None])
+        check(f"[{label}] spec reuse stream == no-reuse (bit-exact)", reu == ref,
+              f"reu_tail={reu[-6:]} ref_tail={ref[-6:]}")
+        check(f"[{label}] spec->classic->spec reuse == no-reuse", mix == ref,
+              f"mix_tail={mix[-6:]} ref_tail={ref[-6:]}")
+
+
 def t_mtp_cache_lifecycle():
     print("MTP block cache: allocated by setup_caches, cleared by clear_caches")
     m = make_model()
@@ -265,7 +482,8 @@ def t_no_mtp_raises():
 def main():
     print(f"\n=== MTP speculative decoding tests (CPU, torch {torch.__version__}) ===\n")
     for t in (t_greedy_equality, t_greedy_equality_no_swa, t_accept_branch_coverage,
-              t_sampled_determinism,
+              t_sampled_determinism, t_spec_verify_primitive,
+              t_sampled_distribution_equivalence, t_spec_reuse_equivalence,
               t_eos_ledger_truth, t_stream_engine_parity, t_mtp_cache_lifecycle, t_no_mtp_raises):
         t()
         print()
