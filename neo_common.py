@@ -352,6 +352,11 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
     return model, cfg
 
 
+# Legacy-faithful RoPE default for ALL load_model_and_tokenizer call sites in a
+# tool process. Set once after argparse: `nc.ENVELOPE_COMPAT_DEFAULT = args.envelope_compat`.
+ENVELOPE_COMPAT_DEFAULT = False
+
+
 def load_model_and_tokenizer(
     checkpoint_path: str,
     device: Optional[str] = None,
@@ -365,6 +370,9 @@ def load_model_and_tokenizer(
     max_memory_per_gpu: Optional[str] = None,  # e.g., "14GiB"
     qk_norm_mode: Optional[str] = None,  # None | "before_rope" | "after_rope_legacy" | "after_rope_fixed"
     use_keel: Optional[bool] = None,  # None = auto-detect from checkpoint, True/False = override
+    envelope_compat: Optional[bool] = None,  # legacy-faithful RoPE for pre-2026-07-02
+    # checkpoints; None -> use the module default (set once by tool CLIs via
+    # `nc.ENVELOPE_COMPAT_DEFAULT = args.envelope_compat`, covering every call site)
 ):
     """Load both tokenizer **and** model; optionally shard across multiple GPUs.
 
@@ -453,6 +461,27 @@ def load_model_and_tokenizer(
         logger.print_and_log(f"Loaded special tokens ({special_tokens_source}): {token_count} tokens [{preview_str}]")
 
     model, cfg = _build_model_from_checkpoint(checkpoint_path, enc, half_precision, qk_norm_mode=qk_norm_mode, use_keel=use_keel)
+
+    if envelope_compat is None:
+        envelope_compat = ENVELOPE_COMPAT_DEFAULT
+    if envelope_compat:
+        # Legacy-faithful RoPE: every FSDP2 checkpoint trained before the
+        # 2026-07-02 meta-init fix learned under CORRUPTED tables (to_empty()
+        # destroyed the freqs buffers; the allocator deterministically left
+        # cos = zeros and sin = the cos table — attention degraded to a
+        # separable cos-envelope). This tool builds CORRECT tables, so legacy
+        # checkpoints otherwise generate ~27 mnats off their native
+        # distribution (dn4@2k: CE 4.4931 native vs 4.5198 corrected).
+        # Reproduce the exact training-time corruption for faithful sampling.
+        with torch.no_grad():
+            _raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+            _ref_cos = _raw.freqs_cos.clone()
+            _raw.freqs_sin.copy_(_ref_cos)   # sin <- the cos table
+            _raw.freqs_cos.zero_()           # cos <- zeros
+        logger.print_and_log(
+            "[envelope-compat] RoPE tables set to the LEGACY corruption "
+            "(cos=0, sin=cos-table) — faithful sampling for checkpoints trained "
+            "before the 2026-07-02 meta-init fix. Do NOT use for wizard-era models.")
 
     device = device or detect_device(preferred_gpu)
 
