@@ -441,9 +441,31 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
     return model, cfg
 
 
-# Legacy-faithful RoPE default for ALL load_model_and_tokenizer call sites in a
-# tool process. Set once after argparse: `nc.ENVELOPE_COMPAT_DEFAULT = args.envelope_compat`.
-ENVELOPE_COMPAT_DEFAULT = False
+# Legacy-faithful (corrupted) RoPE policy for ALL load_model_and_tokenizer call
+# sites in a tool process. TRI-STATE:
+#   None  = AUTO — key off the checkpoint: rope_fixed flag if present, else
+#           checkpoint_version >= ROPE_FIX_CHECKPOINT_VERSION means fixed RoPE;
+#           anything older (or unmarked) is treated as the pre-2026-07-02
+#           CORRUPTED era and gets envelope compat.
+#   True  = force legacy/corrupted RoPE (reproduction / --envelope_compat).
+#   False = force fixed RoPE (--fixed_rope; e.g. a correct-RoPE checkpoint that
+#           still carries an old version number, like the pre-resume wizards).
+# Set once after argparse.
+ENVELOPE_COMPAT_DEFAULT = None
+
+# Checkpoints at/after this version trained under the RoPE meta-init fix. Older
+# ones learned under corrupted freqs tables and must reproduce them at inference.
+ROPE_FIX_CHECKPOINT_VERSION = 4.0
+
+
+def _ckpt_version_ge(ver, target: float) -> bool:
+    """True iff a checkpoint_version string/number is >= target (defensive parse;
+    unknown/garbage -> False so an unrecognized checkpoint is treated as the
+    OLD/corrupted era, matching the safe default)."""
+    try:
+        return float(ver) >= float(target)
+    except (TypeError, ValueError):
+        return False
 
 # Process-wide default for stream_generate_kv's spec= when the caller passes
 # None: None = AUTO (speculative decode on for MTP checkpoints), False = forced
@@ -556,8 +578,28 @@ def load_model_and_tokenizer(
 
     model, cfg = _build_model_from_checkpoint(checkpoint_path, enc, half_precision, qk_norm_mode=qk_norm_mode, use_keel=use_keel)
 
+    # Resolve envelope (legacy/corrupted RoPE) compat. Precedence:
+    #   1. explicit per-call arg (True/False),
+    #   2. process default ENVELOPE_COMPAT_DEFAULT (True=force legacy /
+    #      False=force fixed / None=auto),
+    #   3. AUTO from the checkpoint: an explicit rope_fixed flag wins; otherwise
+    #      checkpoint_version >= ROPE_FIX_CHECKPOINT_VERSION means fixed RoPE and
+    #      anything older/unmarked is the pre-fix CORRUPTED era.
     if envelope_compat is None:
         envelope_compat = ENVELOPE_COMPAT_DEFAULT
+    if envelope_compat is None:
+        _rf = chk_meta.get("rope_fixed", None)
+        _ver = chk_meta.get("checkpoint_version", "2.0")
+        if _rf is not None:
+            envelope_compat = not bool(_rf)
+            _why = f"rope_fixed={_rf}"
+        else:
+            envelope_compat = not _ckpt_version_ge(_ver, ROPE_FIX_CHECKPOINT_VERSION)
+            _why = f"checkpoint_version={_ver} (fix @ {ROPE_FIX_CHECKPOINT_VERSION})"
+        logger.print_and_log(
+            f"[rope] AUTO -> {'LEGACY/corrupted' if envelope_compat else 'FIXED'} "
+            f"RoPE from {_why}. Override with "
+            f"{'--fixed_rope' if envelope_compat else '--envelope_compat'}.")
     if envelope_compat:
         # Legacy-faithful RoPE: every FSDP2 checkpoint trained before the
         # 2026-07-02 meta-init fix learned under CORRUPTED tables (to_empty()
