@@ -407,6 +407,88 @@ def t_spec_reuse_equivalence():
               f"mix_tail={mix[-6:]} ref_tail={ref[-6:]}")
 
 
+def t_spec_reuse_rewind_swa():
+    print("SWA rewind guard vs the spec-REJECT phantom write (regression). A terminal")
+    print("reject forwards a 2-token chunk whose rejected draft is physically written")
+    print("one ring slot PAST the ledger, so at cache length == window the ring has")
+    print("wrapped (slot 0 evicted) while the ledger looks unwrapped. A later REWIND")
+    print("reuse turn must NOT read that phantom — the guard must degrade to full")
+    print("re-prefill. We hit the exact boundary and require bit-exact vs no-reuse.")
+    import re as _re
+
+    def parse_ids(txt):
+        return [int(x) for x in _re.findall(r'<(\d+)>', txt)]
+
+    # small window so the local rings wrap almost immediately; greedy on an
+    # untrained model rejects every draft, so the turn always ENDS on a reject.
+    m = make_model(swa_window=4, doc_attn_mask=False, doc_pos_reset=False)
+    prompt = [7, 9]                    # short: prompt_len + gen lands on Lc
+    ctx = 128
+    m.setup_caches(max_batch_size=1, max_seq_len=ctx, force=True)
+    Lc = m.min_rolling_cache_len()     # ring capacity is only known post-alloc
+    m.clear_caches()
+    if Lc is None:
+        check("model has a rolling SWA ring to exercise", False, "min_rolling_cache_len is None")
+        return
+    # ledger after a greedy (all-reject) turn = prompt_len + gen1 - 1; the phantom
+    # bites at ledger == Lc, i.e. gen1 == Lc - prompt_len + 1. Sweep around it.
+    target = Lc - len(prompt) + 1
+    rewind = [prompt[0], 13]           # shares 1 token -> start_pos=1 (a rewind); id < vocab
+
+    def turn2(reuse, prime_gen1):
+        m.clear_caches()
+        tok = StubTokEnc(prompt)
+        state = nc.CacheState(reusable=True) if reuse else None
+        if reuse:
+            # turn 1 primes + persists the cache/ledger at length prompt+gen1-1
+            nc.stream_generate_kv(m, tok, "p", prime_gen1, ctx, temperature=0.0,
+                                  top_p=1.0, display=False, print_prompt=False,
+                                  cache_state=state, spec=None)
+        tok.set_ids(rewind)
+        txt = nc.stream_generate_kv(m, tok, "p", 6, ctx, temperature=0.0, top_p=1.0,
+                                    display=False, print_prompt=False,
+                                    cache_state=state, spec=None)
+        m.clear_caches()
+        return parse_ids(txt)
+
+    fails = 0
+    for gen1 in range(max(1, target - 2), target + 3):
+        ref = turn2(reuse=False, prime_gen1=gen1)          # fresh cache each time
+        reu = turn2(reuse=True, prime_gen1=gen1)           # rewind reuse
+        ok = (reu == ref)
+        if not ok:
+            fails += 1
+            check(f"gen1={gen1} (ledger~{len(prompt)+gen1-1}, Lc={Lc}): rewind-reuse == no-reuse",
+                  ok, f"reu={reu} ref={ref}")
+    check(f"rewind-reuse bit-exact across the wrap boundary (Lc={Lc}, target gen1={target})",
+          fails == 0)
+
+
+def t_spec_stop_reason_honest():
+    print("stop_reason honesty (regression): spec_generate must NOT report")
+    print("stop_reason=='eos' unless the LAST emitted token is eos. The bug: an")
+    print("accepted draft fills the token cap, the pair's second token nxt is dropped,")
+    print("but the nxt==eos check still set 'eos' (final token = draft != eos).")
+    class EosTok(StubTok):
+        eos_id = 3
+    m = make_model()
+    prompt = [5, 7, 9, 11]
+    violations = 0
+    checked = 0
+    for M in range(2, 13):
+        for seed in range(60):
+            total = len(prompt) + M
+            m.setup_caches(max_batch_size=1, max_seq_len=total, force=True)
+            r = nc.spec_generate(m, EosTok(), None, M, total, temperature=2.5,
+                                 top_p=1.0, seed=seed, prompt_ids=prompt, stop_on_eos=True)
+            m.clear_caches()
+            checked += 1
+            if r["stop_reason"] == "eos" and (not r["token_ids"] or r["token_ids"][-1] != 3):
+                violations += 1
+    check(f"stop_reason=='eos' implies final token is eos ({checked} runs scanned)",
+          violations == 0, f"{violations} runs reported eos with a non-eos final token")
+
+
 def t_mtp_cache_lifecycle():
     print("MTP block cache: allocated by setup_caches, cleared by clear_caches")
     m = make_model()
@@ -484,6 +566,7 @@ def main():
     for t in (t_greedy_equality, t_greedy_equality_no_swa, t_accept_branch_coverage,
               t_sampled_determinism, t_spec_verify_primitive,
               t_sampled_distribution_equivalence, t_spec_reuse_equivalence,
+              t_spec_reuse_rewind_swa, t_spec_stop_reason_honest,
               t_eos_ledger_truth, t_stream_engine_parity, t_mtp_cache_lifecycle, t_no_mtp_raises):
         t()
         print()

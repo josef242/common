@@ -996,11 +996,18 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
             # high-water mark) is UNSOUND once any ring has wrapped — slots for
             # evicted positions hold FUTURE-position K/V (RoPE-baked), so both
             # cached paths silently attend the wrong timeline (measured 7e-2
-            # logit corruption). Append-only reuse stays sound at any length;
-            # unwrapped rings (ledger <= smallest ring) remain rewind-safe.
-            # Degrade to full re-prefill: slow, never wrong.
+            # logit corruption). Append-only reuse stays sound at any length.
+            # The wrap test is `>=`, NOT `>`: a spec-engine terminal REJECT
+            # forwards a 2-token chunk whose rejected draft is PHYSICALLY written
+            # one position PAST the ledger (materialized_len = n_ctx+1 while the
+            # chunk write touches slot (n_ctx+1)%Lc), so the physical ring extent
+            # is len(ledger)+1. At len(ledger)==Lc that phantom has already
+            # evicted slot 0 even though the ledger looks unwrapped — `>` would
+            # miss it and serve wrong-timeline K/V on a rewind. `start_pos <
+            # len(ledger)` already scopes this to rewinds only (append-only reuse
+            # is untouched). Degrade to full re-prefill: slow, never wrong.
             _lc = getattr(model, 'min_rolling_cache_len', lambda: None)()
-            if _lc is not None and start_pos < len(ledger) and len(ledger) > _lc:
+            if _lc is not None and start_pos < len(ledger) and len(ledger) >= _lc:
                 start_pos = 0
             # Spec engine needs the MTP cache in LOCKSTEP with the reused trunk
             # prefix (its own attention runs over all past mtp inputs). If a
@@ -1410,8 +1417,10 @@ def verify_kv_reuse_parity(model, tokenizer, context_size,
                     p = _longest_common_prefix_len(ledger, ids)
                     start_pos = min(p, prompt_len - 1)
                     # mirror stream_generate_kv's SWA rolling-ring rewind guard
+                    # (>= not >: covers the spec-reject phantom write one past the
+                    # ledger — see the primary guard's note above)
                     _lc = getattr(model, 'min_rolling_cache_len', lambda: None)()
-                    if _lc is not None and start_pos < len(ledger) and len(ledger) > _lc:
+                    if _lc is not None and start_pos < len(ledger) and len(ledger) >= _lc:
                         start_pos = 0
                 else:
                     model.setup_caches(max_batch_size=bsz, max_seq_len=total_len, force=True)
@@ -1652,13 +1661,17 @@ def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
                 if len(emitted) < max_new_tokens:
                     emitted.append(nxt)
                     if on_token: on_token(nxt)
-                if stop_on_eos and eos_id is not None and nxt == eos_id:
-                    # EOS as second of the pair: nxt is emitted but NEVER
-                    # forwarded — n_ctx += 2 covers exactly the materialized
-                    # rows (cur, draft); the ledger slice excludes nxt.
-                    n_ctx += 2
-                    stop_reason = "eos"
-                    break
+                    if stop_on_eos and eos_id is not None and nxt == eos_id:
+                        # EOS as second of the pair: nxt IS emitted but never
+                        # forwarded — n_ctx += 2 covers exactly the materialized
+                        # rows (cur, draft); the ledger slice excludes nxt. Guard
+                        # this by `nxt was appended`: if the draft already hit the
+                        # token cap, nxt is dropped and the turn ends via
+                        # max_tokens — reporting "eos" for a token we never
+                        # emitted would make stop_reason lie (last token != eos).
+                        n_ctx += 2
+                        stop_reason = "eos"
+                        break
                 # MTP backfill BOTH rows; row1 (position n_ctx+1) drafts t_{n_ctx+3}
                 nt = torch.tensor([[draft, nxt]], dtype=torch.long, device=device)
                 mtp_logits = model.mtp_decode_chunk(h_pre2, nt, n_ctx)
