@@ -176,8 +176,9 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
     checkpoint_version = chk.get("checkpoint_version", "2.0")  # Default to 2.0 for old checkpoints
     checkpoint_step = chk.get("step", chk.get("iter", "unknown"))
 
-    if checkpoint_version == "3.0":
-        # FSDP2 checkpoint - use common_fsdp2 model (no __call__ override)
+    if _ckpt_version_ge(checkpoint_version, 3.0):
+        # FSDP2 checkpoint (v3.0 and up — v4.0 adds festival self-describe +
+        # rope_fixed but is the SAME format) - use common_fsdp2 model.
         from model_v2 import Transformer, ModelArgs
         logger.print_and_log(f"Detected FSDP2 checkpoint (v{checkpoint_version}), step: {checkpoint_step}")
     else:
@@ -216,9 +217,10 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                 # No QK norm
                 resolved_qk_norm_mode = None
 
-        if checkpoint_version == "3.0":
-            # FSDP2: use filter approach - pass all config keys through to ModelArgs
-            # This is future-proof and automatically handles MoE parameters
+        if _ckpt_version_ge(checkpoint_version, 3.0):
+            # FSDP2 (v3.0+): use filter approach - pass all config keys through to
+            # ModelArgs (filtered to known fields below). Future-proof, handles
+            # MoE + festival params automatically.
             import dataclasses
             model_args = dict(cfg)
             # Festival-feature fallback: checkpoints saved before the whitelist
