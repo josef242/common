@@ -259,7 +259,11 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                         return {
                             'doc_attn_mask': bool(_dm.get('enabled', False)),
                             'doc_pos_reset': bool(_dm.get('reset_positions', False)),
-                            'bos_token_id': int(_dm.get('bos_token_id', 32000)),
+                            # default 1 = SentencePiece BOS (the actual doc
+                            # separator in the tokenized shards), matching the
+                            # trainer's Settings default — NOT the <|bos|>=32000
+                            # special token. Only used if the yaml omits it.
+                            'bos_token_id': int(_dm.get('bos_token_id', 1)),
                             'swa_enabled': bool(_sw.get('enabled', False)),
                             'swa_window': int(_sw.get('window', 512)),
                             'swa_global_interleave': int(_sw.get('global_interleave', 4)),
