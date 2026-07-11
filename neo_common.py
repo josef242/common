@@ -272,8 +272,11 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                             # default 1 = SentencePiece BOS (the actual doc
                             # separator in the tokenized shards), matching the
                             # trainer's Settings default — NOT the <|bos|>=32000
-                            # special token. Only used if the yaml omits it.
+                            # special token. Only used if the yaml omits it;
+                            # '_bos_defaulted' surfaces that as a warning below
+                            # (popped before ModelArgs consumes the dict).
                             'bos_token_id': int(_dm.get('bos_token_id', 1)),
+                            '_bos_defaulted': 'bos_token_id' not in _dm,
                             'swa_enabled': bool(_sw.get('enabled', False)),
                             'swa_window': int(_sw.get('window', 512)),
                             'swa_global_interleave': int(_sw.get('global_interleave', 4)),
@@ -293,6 +296,13 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
                                 f"If this checkpoint predates a flag flip, generation semantics "
                                 f"will be wrong; verify against the config saved nearest the "
                                 f"checkpoint's launch.")
+                        _bos_defaulted = _recovered.pop('_bos_defaulted', False)
+                        if _bos_defaulted and _recovered['doc_attn_mask']:
+                            logger.print_and_log(
+                                "[warn] run-dir yaml omits doc_attn_mask.bos_token_id — "
+                                "defaulting to 1 (SentencePiece BOS; correct for llama-era "
+                                "runs only). If this checkpoint trained on a non-llama "
+                                "tree, its separator differs — set bos_token_id in the yaml.")
                         model_args.update(_recovered)
                         if any((_recovered['doc_attn_mask'], _recovered['swa_enabled'],
                                 _recovered['mtp_enabled'])):
@@ -426,20 +436,24 @@ def _build_model_from_checkpoint(checkpoint_path: str, enc, half_precision: bool
         if getattr(cfg, 'moe_interleave_step', 1) > 1:
             moe_info += f", interleave={cfg.moe_interleave_step}"
         logger.print_and_log(moe_info)
-    # Festival features — these change generation SEMANTICS (windowed vs full-
-    # causal, doc isolation, spec-decode availability), so surface them
-    # unconditionally from the resolved cfg. An affirmative "none" line is
-    # printed when all three are off so their absence is stated, not just missing.
-    _festival = []
+    # doc-mask / SWA / MTP each change generation SEMANTICS (windowed vs full-
+    # causal, doc isolation, spec-decode availability), so surface each one
+    # unconditionally on its own line from the resolved cfg. An explicit "off"
+    # states absence rather than leaving the feature missing from the banner.
     if getattr(cfg, 'doc_attn_mask', False):
-        _festival.append(f"doc-mask on (reset_positions={getattr(cfg, 'doc_pos_reset', False)}, "
-                         f"bos={getattr(cfg, 'bos_token_id', '?')})")
+        logger.print_and_log(f"  doc-mask: on (reset_positions={getattr(cfg, 'doc_pos_reset', False)}, "
+                             f"bos={getattr(cfg, 'bos_token_id', '?')})")
+    else:
+        logger.print_and_log("  doc-mask: off")
     if getattr(cfg, 'swa_enabled', False):
-        _festival.append(f"SWA window={getattr(cfg, 'swa_window', '?')}, "
-                        f"interleave={getattr(cfg, 'swa_global_interleave', '?')}")
+        logger.print_and_log(f"  SWA: on (window={getattr(cfg, 'swa_window', '?')}, "
+                             f"interleave={getattr(cfg, 'swa_global_interleave', '?')})")
+    else:
+        logger.print_and_log("  SWA: off")
     if getattr(cfg, 'mtp_enabled', False):
-        _festival.append("MTP on (self-speculative decode available)")
-    logger.print_and_log(f"  festival: {' | '.join(_festival) if _festival else 'none (all off)'}")
+        logger.print_and_log("  MTP: on (self-speculative decode available)")
+    else:
+        logger.print_and_log("  MTP: off")
     if getattr(cfg, 'gdn_enabled', False):
         logger.print_and_log(f"  GDN: interleave={getattr(cfg, 'gdn_interleave_step', '?')}, "
                              f"n_heads={getattr(cfg, 'n_gdn_heads', '?')}, "
