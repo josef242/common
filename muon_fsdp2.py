@@ -8,8 +8,8 @@
 import math
 from typing import Protocol
 import torch
-from torch.distributed.tensor import DTensor
-from torch.distributed import gather, scatter, broadcast, all_reduce
+from torch.distributed.tensor import DTensor, Shard
+from torch.distributed import gather, scatter, broadcast, all_reduce, get_rank
 from collections import deque
 
 __version__ = "0.5.0"  # Configurable 16-bit Adam states
@@ -22,6 +22,21 @@ __all__ = ["Muon"]
 # =============================================================================
 # MuonSphere: Spectral Sphere Optimization Helpers
 # =============================================================================
+
+_SPHERE_GENERATORS: dict[str, torch.Generator] = {}
+
+
+def _sphere_generator(device) -> torch.Generator:
+    """Per-device generator for power-iteration init, isolated from the global
+    RNG stream (seed fixed; not checkpointed — power iteration's convergence
+    does not depend on the particular random init)."""
+    key = str(device)
+    if key not in _SPHERE_GENERATORS:
+        g = torch.Generator(device=device)
+        g.manual_seed(0x5EED)
+        _SPHERE_GENERATORS[key] = g
+    return _SPHERE_GENERATORS[key]
+
 
 def power_iteration(W: torch.Tensor, num_iters: int = 10) -> tuple[float, torch.Tensor, torch.Tensor]:
     """
@@ -39,8 +54,12 @@ def power_iteration(W: torch.Tensor, num_iters: int = 10) -> tuple[float, torch.
     """
     d_out, d_in = W.shape
 
-    # Initialize v randomly and normalize
-    v = torch.randn(d_in, device=W.device, dtype=W.dtype)
+    # Initialize v randomly and normalize. Dedicated generator, NOT the global
+    # RNG: this runs on the per-param dest_rank only, so drawing from the
+    # default stream permanently desynchronizes per-rank RNG states (and makes
+    # muonsphere runs irreproducible) — audit 2026-07-11.
+    v = torch.randn(d_in, device=W.device, dtype=W.dtype,
+                    generator=_sphere_generator(W.device))
     v = v / v.norm()
 
     # Power iteration: alternately compute u = Wv, v = W'u
@@ -306,6 +325,15 @@ class Fsdp1dWork:
                     f"{tuple(param.shape)} over {_ws} ranks gives uneven Shard(0) locals, which "
                     f"deadlocks the gather in Fsdp1dWork.start (silent NCCL hang). Adjust the "
                     f"model dims or the GPU count.")
+            # The gather/cat(dim=0)/chunk/scatter round-trip below is ONLY the
+            # identity for Shard(0). A Replicate or Shard(1) DTensor passes the
+            # divisibility check above, then NS runs on a wrongly-stacked matrix
+            # and each rank receives a DIFFERENT slice of it — silent cross-rank
+            # parameter desync (audit 2026-07-11). Refuse anything else.
+            if tuple(param.placements) != (Shard(0),):
+                raise ValueError(
+                    f"Muon FSDP2 Fsdp1dWork requires Shard(0) placement; got "
+                    f"{tuple(param.placements)} for param shape {tuple(param.shape)}.")
     
     def start(self):
 
@@ -315,9 +343,16 @@ class Fsdp1dWork:
         assert isinstance(grad, DTensor), "only supports DTensor parameters"
         assert grad.device_mesh.ndim == 1, "only supports 1D mesh"
 
-        rank = grad.device_mesh.get_rank()
         world_size = grad.device_mesh.size()
         pg = grad.device_mesh.get_group()
+        # GROUP-relative rank throughout: dest_rank = index % world_size is a
+        # group-relative id, and every collective below addresses it via
+        # group_dst/group_src. The old code compared it against the GLOBAL
+        # mesh rank and used global-rank src= kwargs — correct only while the
+        # 1D mesh spans the full world starting at rank 0; any sub-world mesh
+        # (HSDP shard dim, sub-mesh experiments) would gather to one physical
+        # rank and scatter from another (audit 2026-07-11).
+        rank = get_rank(pg)
 
         dest_rank = self.index % world_size
 
@@ -348,9 +383,9 @@ class Fsdp1dWork:
         assert self._intermediate_state is not None, "gather work must be called first"
 
         grad = self.param.grad
-        rank = grad.device_mesh.get_rank()
         world_size = grad.device_mesh.size()
         pg = grad.device_mesh.get_group()
+        rank = get_rank(pg)  # group-relative, matching dest_rank (see start())
 
         dest_rank, gather_handle, gather_lists = self._intermediate_state[:3]
         gather_handle.wait()
@@ -389,9 +424,9 @@ class Fsdp1dWork:
                 scale_tensor = torch.tensor([0.0], device=self.param.device, dtype=torch.float32)
                 R_tensor = torch.tensor([0.0], device=self.param.device, dtype=torch.float32)
 
-            # Broadcast scale factor and R to all ranks
-            broadcast(scale_tensor, src=dest_rank, group=pg)
-            broadcast(R_tensor, src=dest_rank, group=pg)
+            # Broadcast scale factor and R to all ranks (group-relative src)
+            broadcast(scale_tensor, group_src=dest_rank, group=pg)
+            broadcast(R_tensor, group_src=dest_rank, group=pg)
 
             scale_factor = scale_tensor.item()
             R = R_tensor.item()
@@ -407,9 +442,9 @@ class Fsdp1dWork:
             g_full_block.copy_(zeropower_via_newtonschulz5(g_full_block, self.group["ns_steps"]))
             g_full_block = g_full_block.type_as(grad)
             chunks = list(g_full_block.chunk(chunks=world_size, dim=0))
-            scatter(grad.to_local(), scatter_list=chunks, src=dest_rank, group=pg, async_op=False)
+            scatter(grad.to_local(), scatter_list=chunks, group_src=dest_rank, group=pg, async_op=False)
         else:
-            scatter(grad.to_local(), None, src=dest_rank, group=pg, async_op=False)
+            scatter(grad.to_local(), None, group_src=dest_rank, group=pg, async_op=False)
 
         update = apply_scaling(grad, self.group["rms_scale"])
 
@@ -535,30 +570,24 @@ class SingelDeviceWork:
         self.lr_scale_overrides = lr_scale_overrides
 
     def start(self):
-        # TODO: muon_update() is not defined — this code path (single-device Muon) is broken and unused
-        update = muon_update(self.param.grad, self.state["momentum_buffer"], self.group["momentum"], self.group["nesterov"], self.group["ns_steps"], self.group["rms_scale"])
-
-        # =============================================================
-        # Weight Decay (standard or cautious) — scaled by lr_scale so a
-        # zeroed-out lr_scale freezes the param entirely (no WD decay).
-        # =============================================================
-        lr_scale = self.lr_scale_overrides.get(id(self.param), 1.0)
-        effective_lr = self.group["lr"] * lr_scale
-        wd = self.wd_overrides.get(id(self.param), self.group["weight_decay"])
-        if wd != 0:
-            if self.group.get("cautious_weight_decay", False):
-                # Cautious Weight Decay: use momentum buffer BEFORE Newton-Schulz
-                apply_cautious_weight_decay(
-                    self.param,
-                    self.state["momentum_buffer"],
-                    effective_lr,
-                    wd
-                )
-            else:
-                # Standard weight decay
-                self.param.mul_(1 - effective_lr * wd)
-
-        self.param.add_(update.reshape(self.param.shape), alpha=-effective_lr)
+        # Deliberately NOT implemented (audit 2026-07-11). The old body called an
+        # undefined muon_update() — and even a working transcription would have
+        # silently trained a DIFFERENT optimizer than Fsdp1dWork (no NorMuon, no
+        # tangent projection, no MuonSphere, no radial telemetry): the exact
+        # single-GPU-vs-8-GPU divergence failure mode this codebase has been
+        # bitten by before. Fail loudly instead. A 1-rank FSDP mesh does NOT
+        # land here (DTensor -> Fsdp1dWork, whose gather/scatter degenerate
+        # cleanly) — so for single-device runs, wrap the model in a 1-rank
+        # fully_shard instead of passing plain tensors. If a true plain-tensor
+        # path is ever needed, implement it as a thin driver over the SAME
+        # helpers Fsdp1dWork.finish uses, and add a parity test against a
+        # 1-rank Fsdp1dWork before enabling it.
+        raise NotImplementedError(
+            "MuonFSDP2: plain-tensor (non-DTensor) Muon params are not supported — "
+            "the single-device path was never finished and would diverge from the "
+            "FSDP path. Use a 1-rank FSDP2 mesh (fully_shard) for single-device "
+            "runs, or move this param to an Adam group."
+        )
 
     def finish(self):
         pass
@@ -678,6 +707,44 @@ class Muon(torch.optim.Optimizer):
         self._last_head_ubar_pre = None          # ||Ubar|| removed from the head update (last head step)
         self._last_head_ubar_post = None         # ||Ubar|| after the write-back (None unless verify)
 
+    def load_state_dict(self, state_dict):
+        """Restore state, then UNDO the stock loader's dtype promotion for the
+        embedded 16-bit Adam states.
+
+        torch.optim.Optimizer.load_state_dict casts every non-'step' float
+        state tensor to the PARAM dtype — with fp32 params that silently turns
+        16-bit exp_avg/exp_avg_sq (adam_state_dtype != 'fp32') into fp32 after
+        any resume: state VRAM doubles and the stochastic-rounding path goes
+        dead, no log (audit 2026-07-11; sibling of the AdamW16bit fix in
+        adamw_16bit.py). The re-cast is exact: checkpoint values were produced
+        in these dtypes. Muon-path buffers (momentum, second momentum) are
+        param-dtype by construction, so the cast is a no-op for them and for
+        adam_state_dtype='fp32' this whole override is a no-op."""
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            if group["use_muon"]:
+                continue
+            for p in group["params"]:
+                st = self.state.get(p)
+                if not st:
+                    continue
+                if self._use_16bit_adam:
+                    for key, signed in (("exp_avg", True), ("exp_avg_sq", False)):
+                        t = st.get(key)
+                        if t is not None and t.is_floating_point():
+                            want = _get_adam_state_dtype(self.adam_state_dtype, signed)
+                            if t.dtype != want:
+                                st[key] = t.to(want)
+                # Step-counter type differs by path (fp32: int, 16-bit: 0-dim
+                # tensor). Coerce on load so an adam_state_dtype change across
+                # a resume hands each path the type it expects.
+                _step = st.get("step")
+                if _step is not None:
+                    if self._use_16bit_adam and not isinstance(_step, torch.Tensor):
+                        st["step"] = torch.tensor(float(_step))
+                    elif not self._use_16bit_adam and isinstance(_step, torch.Tensor):
+                        st["step"] = int(_step.item())
+
     def _get_work_class(self, p: torch.Tensor) -> tuple[type[Work], int]:
         """
         dispatch the work class based on the mesh dimension.
@@ -706,6 +773,26 @@ class Muon(torch.optim.Optimizer):
         # short-circuit, or the _wsq==0 guard) genuinely yields NO entry — the shadow controller's
         # accumulator must not re-add a stale prior-step increment as phantom free-growth.
         self.radial_stats.clear()
+        # Verify-off steps must not serve a stale post-write residual from an
+        # earlier verify-on step (audit 2026-07-11).
+        if not self._head_gauge_verify:
+            self._last_head_ubar_post = None
+
+        # In-file fence (audit 2026-07-11): the 16-bit Adam path implements
+        # NEITHER head-gauge projection NOR cautious weight decay. train_mara
+        # fatals these combos at boot, but that safety lives outside this file
+        # — consolidate_optimizer (and any future caller) passes both settings
+        # straight through. Refuse here so the divergence can't go silent.
+        if self._use_16bit_adam:
+            if self.head_gauge_ids:
+                raise RuntimeError(
+                    "MuonFSDP2: head_gauge_projection requires adam_state_dtype='fp32' "
+                    "— the 16-bit Adam path has no gauge-projection hook.")
+            for _g in self.param_groups:
+                if not _g.get("use_muon") and _g.get("cautious_weight_decay", False):
+                    raise RuntimeError(
+                        "MuonFSDP2: cautious_weight_decay on Adam groups requires "
+                        "adam_state_dtype='fp32' — not implemented in the 16-bit path.")
 
         for group in self.param_groups:
 
@@ -726,6 +813,13 @@ class Muon(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         if group.get("use_normuon", False):
                             state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+                    elif group.get("use_normuon", False) \
+                            and "second_momentum_buffer" not in state:
+                        # NorMuon enabled ACROSS a resume: momentum state exists
+                        # from the checkpoint but the second-moment buffer does
+                        # not — lazily init instead of KeyError'ing in finish()
+                        # (audit 2026-07-11).
+                        state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
 
                     class_work, prefetch_factor = self._get_work_class(p)
 
