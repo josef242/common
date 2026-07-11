@@ -33,6 +33,21 @@ import torch.utils.checkpoint as cp
 import torch._dynamo
 from contextlib import nullcontext
 
+
+def _in_backward_recompute() -> bool:
+    """True inside an activation-checkpoint RECOMPUTE pass.
+
+    Non-reentrant AC (use_reentrant=False, what this file uses) re-executes the
+    checkpointed forward INSIDE loss.backward(), with grad enabled — so neither
+    self.training nor torch.is_grad_enabled() can tell the passes apart. What
+    can: the recompute runs within the autograd engine's backward graph task,
+    where _current_graph_task_id() returns a valid id; every ordinary forward
+    (stored-forward AC pass, plain training, eval) returns -1. Private API, but
+    torch 2.9 exposes no public equivalent (verified empirically 2026-07-13;
+    pinned by tests/test_moe.py). Used to run telemetry side effects exactly
+    once per step — the forward MATH must stay identical in both passes."""
+    return torch._C._current_graph_task_id() != -1
+
 # ----------------------------------------------------------------------------
 # Cross Entropy Helper (memory-efficient CCE)
 # ----------------------------------------------------------------------------
@@ -404,7 +419,15 @@ class ModelArgs:
     # path only; the KV-cache generate path is single-document and unchanged.
     doc_attn_mask: bool = False
     doc_pos_reset: bool = False
-    bos_token_id: int = 32000
+    # -1 = "not set" sentinel. There is NO safe universal default: the ecosystem
+    # has multiple document separators (SentencePiece BOS=1 in llama pretrain
+    # shards, <|bos|>=32000 in extended-special chat data, <|endoftext|> in
+    # tiktoken trees). Constructors that enable doc_attn_mask/doc_pos_reset must
+    # pass the id explicitly — Transformer.__init__ enforces it — and the
+    # trainer derives/cross-checks it against tokenizer.bos_id at boot
+    # ([bos-check] banner). The old default here (32000) silently mismatched
+    # the actual llama shard separator (1).
+    bos_token_id: int = -1
     # Sliding-window attention (branch doc-mask, festival feature 2). Hybrid
     # local:global — a layer is GLOBAL when layer_id % swa_global_interleave ==
     # swa_global_interleave - 1 (mirrors the GDN interleave convention; 4 -> 3:1
@@ -419,6 +442,11 @@ class ModelArgs:
     # module predicting t+2 through one extra block + the shared norm/head.
     # Loss weight is applied by the trainer (z-loss pattern), not the model.
     mtp_enabled: bool = False
+    # Ignore MTP loss rows whose 2-token window crosses a document boundary
+    # (targets[i] == BOS => the t+2 target is the NEXT doc's first content
+    # token, conditioned on prev-doc state). Default False = original
+    # DeepSeek-style behavior, byte-identical for existing runs.
+    mtp_doc_boundary_mask: bool = False
 
 def _block_attn_res_fn(partial_block, qk, eps, *blocks):
     """AttnRes core — all intermediates recomputed during backward via checkpoint.
@@ -1276,8 +1304,16 @@ class MoE(nn.Module):
         # Route tokens to experts (identical routing on all ranks — gate is replicated)
         top_scores, selected, num_tpe, aux_loss = self.router(x_flat, self.expert_bias)
         self._last_aux_loss = aux_loss
-        with torch.no_grad():
-            self.tokens_per_expert.add_(num_tpe)
+        # Balance-counter side effect runs EXACTLY ONCE per training forward
+        # (audit 2026-07-11 #13): (a) training-gated — val forwards must not
+        # feed the aux-loss-free bias signal; (b) recompute-gated — non-
+        # reentrant activation checkpointing re-executes this forward inside
+        # loss.backward(), which used to double every count. The forward MATH
+        # is identical in both passes (required for correct grads); only the
+        # side effect is skipped.
+        if self.training and not _in_backward_recompute():
+            with torch.no_grad():
+                self.tokens_per_expert.add_(num_tpe)
 
         # ── Capacity-based token dropping (training only) ──
         if self.capacity_factor > 0 and self.training:
@@ -1299,15 +1335,23 @@ class MoE(nn.Module):
                     drop[topk_idx] = False
                     keep_mask.view(-1)[expert_positions[drop]] = False
             n_dropped = (~keep_mask).sum().item()
-            self._tokens_dropped_accum += n_dropped
+            if not _in_backward_recompute():  # once per step, like tokens_per_expert
+                self._tokens_dropped_accum += n_dropped
             if n_dropped > 0:
-                # Unbiased rescaling: scale kept scores so expected value is preserved
-                sum_all = top_scores.sum()
+                # A dropped slot simply loses its contribution (the residual
+                # stream still carries the token) — matching every reference
+                # that drops: Switch/GShard never rescale survivors, and
+                # DeepSeek-V2's device-level dropping describes no compensation
+                # (V3 drops nothing at all, which aux-loss-free balancing makes
+                # attainable). The previous batch-GLOBAL rescale here
+                # (sum_all/sum_keep applied to every kept slot) preserved the
+                # batch's expected combine mass but was per-token biased:
+                # tokens with NO dropped slots had their weights inflated by
+                # OTHER tokens' drops — cross-token coupling that also broke
+                # route_norm's per-token sum. Removed 2026-07-13 after
+                # reference research (audit finding #7). Drop-rate telemetry:
+                # _tokens_dropped_accum.
                 top_scores = top_scores * keep_mask
-                sum_keep = top_scores.sum()
-                if sum_keep > 0:
-                    scale = (sum_all / sum_keep).clamp_(max=10.0)
-                    top_scores = top_scores * scale
                 # Sentinel expert ID sorts dropped slots to the end
                 selected = selected.clone()
                 selected[~keep_mask] = self.router.num_experts
@@ -1655,6 +1699,17 @@ class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
         super().__init__()
         self.params = params
+        # doc-mask/pos-reset/mtp-boundary-mask key on token==bos_token_id; the
+        # -1 "not set" sentinel would silently never match (the feature becomes
+        # a no-op), so refuse to build a model that needs the id but wasn't
+        # given one.
+        if (params.doc_attn_mask or params.doc_pos_reset
+                or getattr(params, 'mtp_doc_boundary_mask', False)) \
+                and params.bos_token_id < 0:
+            raise ValueError(
+                "doc_attn_mask/doc_pos_reset/mtp_doc_boundary_mask require an explicit "
+                "bos_token_id (ModelArgs defaults to the -1 'not set' sentinel; there is "
+                "no safe universal document-separator id — use tokenizer.bos_id)")
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
         
@@ -1745,10 +1800,15 @@ class Transformer(nn.Module):
             # GDN output projection: scaled init like wo
             elif '.gdn_attn.o_proj.weight' in pn:
                 torch.nn.init.normal_(p, mean=0.0, std=output_std)
-            # Expert weights (3D nn.Parameter, no .weight suffix — not hit by _init_weights)
-            elif '.experts.w1' in pn:
+            # Expert weights (3D nn.Parameter, no .weight suffix — not hit by _init_weights).
+            # Convention matches THIS codebase's dense FFN (w1,w2 @ 0.02; only w3
+            # depth-scaled), NOT torchtitan's (w2 AND w3 scaled). We originally copied
+            # torchtitan's expert init verbatim, which under our dense convention left
+            # routed experts ~sqrt(2*n_layers)x weaker at boot than the shared expert
+            # in the same layer (audit 2026-07-11 #14; ruled unintentional 2026-07-13).
+            elif '.experts.w1' in pn or '.experts.w2' in pn:
                 torch.nn.init.normal_(p, mean=0.0, std=0.02)
-            elif '.experts.w2' in pn or '.experts.w3' in pn:
+            elif '.experts.w3' in pn:
                 torch.nn.init.normal_(p, mean=0.0, std=output_std)
 
         # MTP (festival feature 3): constructed AND initialized LAST — strictly
@@ -1872,15 +1932,49 @@ class Transformer(nn.Module):
                 if hasattr(module, 'weight') and module.weight is not None:
                     torch.nn.init.ones_(module.weight)
             elif isinstance(module, GroupedExperts):
-                # 3D expert weights: w1 gets standard init, w2/w3 get scaled init
+                # 3D expert weights — same convention as the dense FFN here
+                # (w1,w2 @ 0.02; only w3 depth-scaled). See the construction-path
+                # comment in __init__ for the torchtitan-lineage history.
                 torch.nn.init.trunc_normal_(module.w1, mean=0.0, std=0.02)
-                torch.nn.init.trunc_normal_(module.w2, mean=0.0, std=output_std)
+                torch.nn.init.trunc_normal_(module.w2, mean=0.0, std=0.02)
                 torch.nn.init.trunc_normal_(module.w3, mean=0.0, std=output_std)
             elif isinstance(module, MoE):
                 # Re-init buffers on correct device after materialization
                 if module.load_balance_coeff is not None:
                     module.expert_bias.zero_()
                 module.tokens_per_expert.zero_()
+            elif isinstance(module, nn.Conv1d):
+                # GDN short-conv: FLA ShortConvolution subclasses Conv1d, and
+                # the inherited kaiming-uniform reset IS its construction init.
+                module.reset_parameters()
+            elif _GatedDeltaNet is not None and isinstance(module, _GatedDeltaNet):
+                # FLA VALUE-constructs A_log/dt_bias in __init__ (no nn.init),
+                # so the meta-init to_empty() flow leaves them uninitialized-
+                # garbage unless we replay the recipe here (RoPE-freqs bug
+                # class; see the freqs comment below). Recipe verified against
+                # fla/layers/gated_deltanet.py 2026-07-11:
+                #   A_log   = log(U(0, 16))
+                #   dt_bias = inv_softplus(clamp(exp(U(ln 1e-3, ln 1e-1)), min=1e-4))
+                # Child Linears/convs/norms re-init via their own branches.
+                with torch.no_grad():
+                    module.A_log.uniform_(0.0, 16.0).log_()
+                    _db = module.dt_bias
+                    _db.uniform_(math.log(1e-3), math.log(1e-1)).exp_().clamp_(min=1e-4)
+                    _db.add_(torch.log(-torch.expm1(-_db)))
+            elif module.__class__.__name__ in ('FusedRMSNormGated', 'FusedRMSNormSwishGate') \
+                    and hasattr(module, 'reset_parameters'):
+                # GDN o_norm: FLA's gated norm class, invisible to the
+                # isinstance(RMSNorm) branch above. Its reset_parameters is
+                # ones-init.
+                module.reset_parameters()
+            elif isinstance(module, Attention) and hasattr(module, 'mask'):
+                # torch<2.0 manual-path causal mask buffer (registered only when
+                # neither flash-attn nor SDPA exists) — same to_empty() hazard
+                # class as the RoPE freqs. Unreachable on any FSDP2-capable
+                # torch; recomputed for meta-init completeness.
+                with torch.no_grad():
+                    _mask = torch.full_like(module.mask, float("-inf"))
+                    module.mask.copy_(torch.triu(_mask, diagonal=1))
 
         # Apply scaled initialization to output projections (w3, wo, GDN o_proj)
         # These benefit from smaller init to prevent output explosion in deep nets
@@ -1891,6 +1985,14 @@ class Transformer(nn.Module):
                 torch.nn.init.trunc_normal_(param, mean=0.0, std=output_std)
             elif '.gdn_attn.o_proj.weight' in name:
                 torch.nn.init.trunc_normal_(param, mean=0.0, std=output_std)
+
+        # AttnRes pseudo-queries: ZERO by design (uniform depth-mixing at boot).
+        # Plain Parameters in a ParameterList — no module branch above touches
+        # them, so without this they'd stay to_empty() garbage. zeros_ draws no
+        # RNG, so the paired-arm draw ordering is unaffected.
+        if getattr(self, 'attn_res_enabled', False):
+            for _q in self.attn_res_queries:
+                torch.nn.init.zeros_(_q)
 
         # MTP pass — LAST, after every trunk draw in both loops above, so trunk
         # init is bit-identical with/without MTP under the same seed (any RNG
@@ -2459,6 +2561,15 @@ class Transformer(nn.Module):
                     mtp_tgt = torch.cat(
                         [targets[:, 1:],
                          targets.new_full((targets.shape[0], 1), pad_id)], dim=1)
+                    if self.params.mtp_doc_boundary_mask:
+                        # Row i conditions on emb(targets[i]); when targets[i]
+                        # is BOS, mtp_tgt[i] is the NEXT document's first
+                        # content token — cross-document supervision under
+                        # doc-mask. Ignore those rows. (Predicting the BOS
+                        # itself, targets[i+1]==BOS, stays trained — same as
+                        # the main head.)
+                        mtp_tgt = mtp_tgt.masked_fill(
+                            targets == self.params.bos_token_id, pad_id)
                     hm_flat = h_mtp.reshape(-1, h_mtp.size(-1))
                     if hm_flat.dtype != out_dtype:
                         hm_flat = hm_flat.to(out_dtype)
@@ -2534,6 +2645,14 @@ class Transformer(nn.Module):
             return None, loss
 
         # ── INFERENCE / EVAL BRANCH ────────────────────────────────
+        if scaffold_mode:
+            # Under scaffold the final self.norm was skipped above (the deepest
+            # aux head owns the readout); projecting the UN-normalized stream
+            # through the head yields silently-garbage logits (audit 2026-07-11).
+            raise ValueError(
+                "scaffold_mode=True requires targets — the eval branch has no "
+                "normalized stream to project. Read the aux-head losses from a "
+                "training forward instead.")
         logits = self.output(h)
         return logits, None
 
