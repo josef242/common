@@ -790,6 +790,59 @@ def _load_special_tokens(special_tokens_config) -> Optional[List[str]]:
     return None
 
 
+###############################################################################
+# Raw-audio (mu-law) tokenizer — for next-sample audio LMs (dirty-paws)
+###############################################################################
+class RawAudioTokenizer(BaseTokenizer):
+    """There is no text: tokens ARE mu-law sample codes (0..n_levels-1) plus an
+    optional clip-boundary BOS at id n_levels. Shards are built by
+    tools/prepare_audio.py, NOT by text encode(), so the text paths raise.
+
+    vocab = n_levels (+1 for BOS). pad_id is a never-occurring sentinel (== vocab)
+    so NOTHING is dropped from the loss — every mu-law sample AND the BOS is a real
+    target. Critically, code 0 is a real (loud-negative) sample, so pad_id must NOT
+    be 0 the way a text tokenizer's pad often is."""
+
+    def __init__(self, n_levels: int = 256, with_bos: bool = True):
+        self.n_levels = int(n_levels)
+        self.with_bos = bool(with_bos)
+        self._vocab = self.n_levels + (1 if self.with_bos else 0)
+        self.pad_id = self._vocab            # sentinel: never occurs in [0, vocab)
+
+    @property
+    def bos_id(self) -> int:
+        return self.n_levels if self.with_bos else -1
+
+    @property
+    def eos_id(self) -> int:
+        return -1                            # raw audio has no EOS
+
+    def __len__(self) -> int:
+        return self._vocab
+
+    @property
+    def base_vocab_size(self) -> int:
+        return self._vocab
+
+    @property
+    def auto_added_tokens(self) -> int:
+        return 0
+
+    def encode(self, text: str, *, bos: bool = False, eos: bool = False):
+        raise NotImplementedError(
+            "RawAudioTokenizer has no text encode; build shards with prepare_audio.py")
+
+    def encode_to_uint16(self, text: str, *, add_bos: bool = True):
+        raise NotImplementedError("RawAudioTokenizer: build shards with prepare_audio.py")
+
+    def encode_to_uint32(self, text: str, *, add_bos: bool = True):
+        raise NotImplementedError("RawAudioTokenizer: build shards with prepare_audio.py")
+
+    def decode(self, ids: Sequence[int]) -> str:
+        # not used in training; benign placeholder so any logging path can't crash
+        return f"<{len(list(ids))} mu-law audio samples>"
+
+
 def get_tokenizer(
     kind: str = "llama",
     path: Optional[str | Path] = None,
@@ -833,6 +886,14 @@ def get_tokenizer(
             or (f"{kind_lc}_base" if kind_lc != "tiktoken" else "cl100k_base")
         )
         tokenizer = TikTokenAdapter(name=str(encoding_name), special_tokens=tokens_list)
+
+    # ----- raw audio (mu-law next-sample LM) -----------------------------
+    elif kind_lc in {"raw_audio", "raw-audio", "mulaw", "raw"}:
+        try:                                  # path may optionally set mu-law levels
+            n_levels = int(path) if path is not None else 256
+        except (TypeError, ValueError):
+            n_levels = 256
+        tokenizer = RawAudioTokenizer(n_levels=n_levels, with_bos=True)
 
     # ----- claude numeric tokenizer --------------------------------------
     elif kind_lc == "claude":

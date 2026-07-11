@@ -807,8 +807,12 @@ class PercentageDataLoader:
                 arr = np.load(path, mmap_mode='r')
                 # Force the mmap to be fully materialized here so any deferred
                 # I/O failure surfaces inside this try block (astype triggers
-                # the read for uint16; uint32 path needs an explicit copy).
+                # the read for uint16/uint8; uint32 path needs an explicit copy).
                 if arr.dtype == np.uint16:
+                    arr = arr.astype(np.int32)
+                elif arr.dtype == np.uint8:
+                    # mu-law / raw-audio tokens (vocab <= 256): half the bytes of
+                    # uint16, so half the NAS read bandwidth per audio sample.
                     arr = arr.astype(np.int32)
                 elif arr.dtype == np.uint32:
                     arr = np.ascontiguousarray(arr, dtype=np.int32)
