@@ -75,6 +75,21 @@ def _global_row_mean(weight, vocab_dim=0):
     means so unequal shard sizes are handled exactly.
     """
     is_dt = isinstance(weight, DTensor)
+    if is_dt:
+        # The sum+count reduction below is exact ONLY for a 1D mesh with
+        # Shard(vocab_dim) or Replicate placement. A column-sharded head would
+        # sum row-sums of DISJOINT column blocks elementwise (silently wrong
+        # mean per vocab region), and a >1D mesh has no single group to reduce
+        # over — refuse rather than centering with a corrupt gauge (audit
+        # 2026-07-11; same guard pattern as Muon's Shard(0) check).
+        _ok = weight.device_mesh.ndim == 1 and all(
+            pl.is_shard(dim=vocab_dim) or pl.is_replicate()
+            for pl in weight.placements)
+        if not _ok:
+            raise ValueError(
+                f"row_center._global_row_mean requires a 1D mesh with "
+                f"Shard({vocab_dim})/Replicate placement; got mesh ndim="
+                f"{weight.device_mesh.ndim}, placements={tuple(weight.placements)}.")
     local = weight._local_tensor if is_dt else weight
     if vocab_dim != 0:
         local = local.transpose(0, vocab_dim)

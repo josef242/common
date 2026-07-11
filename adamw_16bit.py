@@ -110,7 +110,14 @@ def _single_param_adam_16bit(
 
     if max_exp_avg_sq is not None:
         max_exp_avg_sq_f32 = torch.maximum(max_exp_avg_sq.float(), exp_avg_sq_f32)
-        max_exp_avg_sq.copy_(max_exp_avg_sq_f32)
+        # SR for bf16, like its sibling states above — deterministic rounding
+        # of a slow-moving value in bf16 is the EMA-stall mode the module
+        # docstring warns about (audit 2026-07-11; unreachable until amsgrad
+        # is ever enabled, fixed for completeness).
+        if max_exp_avg_sq.dtype == torch.bfloat16:
+            max_exp_avg_sq.copy_(_fp32_to_bf16_sr(max_exp_avg_sq_f32))
+        else:
+            max_exp_avg_sq.copy_(max_exp_avg_sq_f32)
         denom = (max_exp_avg_sq_f32.sqrt() / bias_correction2.sqrt()) + eps
     else:
         denom = (exp_avg_sq_f32.sqrt() / bias_correction2.sqrt()) + eps
@@ -230,6 +237,30 @@ class AdamW16bit(_AdamBase):
         # Not used — _new_buffer is overridden. Must exist to satisfy ABC.
         raise NotImplementedError("AdamW16bit uses _new_buffer override, not _subclass_zeros")
 
+    def load_state_dict(self, state_dict):
+        """Restore state, then UNDO the stock loader's dtype promotion.
+
+        torch.optim.Optimizer.load_state_dict casts every non-'step' float
+        state tensor to the PARAM dtype — for fp32 params that silently turns
+        the 16-bit exp_avg/exp_avg_sq into fp32 after any resume: optimizer
+        state VRAM doubles and the bf16 stochastic-rounding path goes dead,
+        with no error or log (audit 2026-07-11). Re-cast to the configured
+        storage dtypes; a plain .to() is exact here because the checkpoint
+        values were produced in these dtypes in the first place."""
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            for p in group["params"]:
+                st = self.state.get(p)
+                if not st:
+                    continue
+                for key, signed in (("exp_avg", True), ("exp_avg_sq", False),
+                                    ("max_exp_avg_sq", False)):
+                    t = st.get(key)
+                    if t is not None and t.is_floating_point():
+                        want = self._get_state_dtype(signed)
+                        if t.dtype != want:
+                            st[key] = t.to(want)
+
     @torch.no_grad()
     def step(self, closure=None):
         """Performs a single optimization step.
@@ -264,10 +295,14 @@ class AdamW16bit(_AdamBase):
                 state["step"] += 1
 
                 if not isinstance(group["lr"], Tensor):
-                    raise RuntimeError(
-                        "lr was changed to a non-Tensor object. If you want to update lr, please use "
-                        "optim.param_groups[0]['lr'].fill_(new_lr)"
-                    )
+                    # torchao's tensor-lr contract exists to avoid torch.compile
+                    # recompiles — but this step is deliberately NOT compiled (see
+                    # below), so a float lr is mathematically fine. It also arrives
+                    # legitimately: DCP resume (_init_optim_state) rewrites group lr
+                    # as float 0.0 and runs a state-priming step() BEFORE loading —
+                    # the old raise here crashed every adamw_16bit/adamc_16bit
+                    # resume. Normalize instead of raising (audit 2026-07-11).
+                    group["lr"] = torch.tensor(float(group["lr"]))
 
                 # Call directly (not compiled) — torch.compile + DTensor
                 # random ops (randint_like for stochastic rounding) conflict
@@ -403,6 +438,17 @@ class AdamC16bit:
     def zero_grad(self, set_to_none=True):
         """Clear gradients."""
         self._base_optimizer.zero_grad(set_to_none=set_to_none)
+
+    # Optimizer-shaped state delegation: this wrapper is not a
+    # torch.optim.Optimizer subclass, so without these any external tool
+    # calling optimizer.state_dict() got AttributeError (the trainer's
+    # getattr(_base_optimizer) unwrap still works and stays canonical).
+    # AdamW16bit.load_state_dict's 16-bit dtype re-cast rides along free.
+    def state_dict(self):
+        return self._base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        return self._base_optimizer.load_state_dict(state_dict)
 
     @property
     def state(self):

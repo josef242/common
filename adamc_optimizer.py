@@ -244,6 +244,16 @@ class AdamC8bitTorchAO:
         """Clear gradients."""
         self._base_optimizer.zero_grad(set_to_none=set_to_none)
 
+    # Optimizer-shaped state delegation: this wrapper is not a
+    # torch.optim.Optimizer subclass, so without these any external tool
+    # calling optimizer.state_dict() got AttributeError (the trainer's
+    # getattr(_base_optimizer) unwrap still works and stays canonical).
+    def state_dict(self):
+        return self._base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        return self._base_optimizer.load_state_dict(state_dict)
+
     @property
     def state(self):
         """Return the base optimizer's state."""

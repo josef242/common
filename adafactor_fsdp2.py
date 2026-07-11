@@ -84,19 +84,23 @@ class AdafactorFSDP2(Optimizer):
     def _rms(self, tensor):
         """Compute RMS of tensor, handling DTensor with all-reduce."""
         sum_sq = tensor.pow(2).sum()
+        # DTensor.numel() already returns the GLOBAL numel (verified
+        # empirically) — the old `numel * world_size` double-counted, so the
+        # multi-rank RMS came out sqrt(world_size) LOW and the update-RMS clip
+        # (clip_threshold) effectively never engaged on the rigs while working
+        # on single GPU (audit 2026-07-11).
         numel = tensor.numel()
 
-        # If DTensor (FSDP2), all-reduce to get global RMS
+        # If DTensor (FSDP2), all-reduce the local partial sum to the global sum
         if isinstance(tensor, DTensor):
             pg = tensor.device_mesh.get_group()
-            world_size = tensor.device_mesh.size()
-            # sum_sq is also a DTensor after reduction, use local tensor for all-reduce
+            # sum_sq is a Partial-placement DTensor after .sum(); all-reduce its
+            # local partial to materialize the global sum
             if isinstance(sum_sq, DTensor):
                 dist.all_reduce(sum_sq._local_tensor, group=pg)
                 sum_sq = sum_sq._local_tensor
             else:
                 dist.all_reduce(sum_sq, group=pg)
-            numel = numel * world_size
 
         return (sum_sq / numel).sqrt()
 
@@ -230,13 +234,20 @@ class AdafactorFSDP2(Optimizer):
                     # Apply the update
                     p_fp32.add_(update.float(), alpha=-group["lr"])
 
-                    # Stochastic rounding: add uniform noise scaled to dtype precision
-                    # before casting back. This makes rounding probabilistic based on
-                    # the fractional part, removing systematic bias.
-                    # BF16/FP16 have ~2^-7 relative precision, so noise in [-0.5, 0.5) * ulp
-                    noise = torch.empty_like(p_fp32).uniform_(-0.5, 0.5)
-                    noise.mul_((2**-7) * p_fp32.abs().clamp_(min=1e-30))
-                    p.copy_((p_fp32 + noise).to(p.dtype))
+                    # Stochastic rounding back to the storage dtype.
+                    # bf16: exact bit-level SR (unbiased, shared with
+                    # row_center/adamw_16bit). fp16: dither at the TRUE fp16
+                    # relative ULP (2^-11) — the old hardcoded 2^-7 injected
+                    # ~16 ULP of random walk per step into fp16 weights
+                    # (audit 2026-07-11; and its comment claimed fp16 has
+                    # 2^-7 precision, which is bf16's).
+                    if p.dtype == torch.bfloat16:
+                        from row_center import _fp32_to_bf16_sr
+                        p.copy_(_fp32_to_bf16_sr(p_fp32))
+                    else:
+                        noise = torch.empty_like(p_fp32).uniform_(-0.5, 0.5)
+                        noise.mul_((2**-11) * p_fp32.abs().clamp_(min=1e-30))
+                        p.copy_((p_fp32 + noise).to(p.dtype))
                 else:
                     # FP32 path - no stochastic rounding needed
                     if group["weight_decay"] != 0:
