@@ -152,17 +152,20 @@ class LayerDiagnostics:
         """
         Compute sum of squared norms for a list of parameters (or their gradients).
         Returns a scalar tensor on the current device.
+
+        MUST sum the LOCAL shard only: callers all-reduce the result via
+        _reduce_norm_squared(). Summing the DTensor directly resolves to the
+        GLOBAL sum, and the subsequent all-reduce double-counts by world_size
+        (the sqrt(8) w_norm inflation bug, fixed 2026-07-12).
         """
         total = torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
 
         for p in params:
             if use_grad:
                 if p.grad is not None:
-                    # Handle sharded gradients - use the local shard
-                    total += p.grad.detach().float().pow(2).sum()
+                    total += self._get_local_data(p.grad).detach().float().pow(2).sum()
             else:
-                # Handle sharded parameters - use the local shard
-                total += p.detach().float().pow(2).sum()
+                total += self._get_local_data(p).detach().float().pow(2).sum()
 
         return total
 
@@ -882,6 +885,10 @@ class LayerDiagnostics:
             # Convert to JSON-serializable dict
             data = {
                 'step': snapshot.step,
+                # norm_v 2 = w_norm/g_norm/w_rms computed from local shards (single
+                # reduction). Unstamped lines predate the sqrt(world_size) inflation
+                # fix; tools/fix_diagnostics_norms.py rescales exactly those.
+                'norm_v': 2,
                 'total_tokens': snapshot.total_tokens,
                 'tok_embeddings': self._block_to_dict(snapshot.tok_embeddings),
                 'output': self._block_to_dict(snapshot.output) if snapshot.output else None,
