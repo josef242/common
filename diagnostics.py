@@ -636,10 +636,12 @@ class LayerDiagnostics:
     def _snapshot_block(self, key: str, params: List[torch.nn.Parameter], device: str):
         """Clone param data and record local w_norm² + global numel for a single block.
 
-        Contributions are divided by _replication_factor: ROOT-group params
-        (out/emb/norm) are unsharded full tensors on every rank, and without the
-        divisor their param_delta_norm/update_rms came out sqrt(world_size)
-        inflated (found 2026-07-13; the layer DTensors were always correct here)."""
+        Contributions are divided by _replication_factor. NOTE: at this call
+        point (post-backward, pre-step) ALL params — including the root group —
+        are sharded DTensors, so the factor is 1 and historical
+        param_delta_norm/update_rms were always correct (verified 2026-07-13
+        via pdn/pdr reconstruction). The divisor is kept as defense: it engages
+        only if a plain replicated tensor ever reaches this path."""
         clones = []
         w_norm_sq = torch.tensor(0.0, device=device)
         for p in params:
