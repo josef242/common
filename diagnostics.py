@@ -153,19 +153,23 @@ class LayerDiagnostics:
         Compute sum of squared norms for a list of parameters (or their gradients).
         Returns a scalar tensor on the current device.
 
-        MUST sum the LOCAL shard only: callers all-reduce the result via
-        _reduce_norm_squared(). Summing the DTensor directly resolves to the
-        GLOBAL sum, and the subsequent all-reduce double-counts by world_size
-        (the sqrt(8) w_norm inflation bug, fixed 2026-07-12).
+        Each tensor's local contribution is divided by _replication_factor so
+        that the caller's world all-reduce (_reduce_norm_squared) counts every
+        element exactly once. Two sqrt(world_size) inflation bugs lived here:
+        (1) summing the full DTensor (resolves to the GLOBAL sum) before the
+        all-reduce — fixed 2026-07-12 via local shards; (2) FSDP2 ROOT-group
+        params (tok_embeddings/output/final norm) never reshard and appear as
+        identical plain FULL tensors on every rank, so their local "shard" IS
+        the full tensor — fixed 2026-07-13 via the replication divisor.
         """
         total = torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
 
         for p in params:
-            if use_grad:
-                if p.grad is not None:
-                    total += self._get_local_data(p.grad).detach().float().pow(2).sum()
-            else:
-                total += self._get_local_data(p).detach().float().pow(2).sum()
+            t = p.grad if use_grad else p
+            if t is None:
+                continue
+            total += (self._get_local_data(t).detach().float().pow(2).sum()
+                      / self._replication_factor(t))
 
         return total
 
@@ -183,6 +187,31 @@ class LayerDiagnostics:
     def _get_local_data(p):
         """Get local tensor data, bypassing DTensor dispatch for direct shard access."""
         return p.to_local() if hasattr(p, 'to_local') else p.data
+
+    def _replication_factor(self, t) -> float:
+        """How many ranks hold each element of t's LOCAL view. Contributions to a
+        world all-reduce must be divided by this so every element counts once.
+
+        - sharded DTensor: each element lives on exactly one rank -> 1.0
+          (times the size of any Replicate mesh dim)
+        - plain tensor in a distributed run: FSDP2 ROOT-group params
+          (tok_embeddings / output / final norm — the root fully_shard group
+          never reshards after forward) appear as the identical FULL tensor on
+          every rank -> world_size. This was sqrt(8) inflation mechanism #2
+          (2026-07-13): mechanism #1 (DTensor global sum) was fixed a day
+          earlier, which cured the per-layer norms while out/emb stayed
+          inflated — the tell that exposed this one.
+        """
+        if not (self.ddp and self.ddp_world_size > 1):
+            return 1.0
+        if hasattr(t, 'placements'):  # DTensor
+            factor = 1.0
+            mesh = t.device_mesh
+            for i, placement in enumerate(t.placements):
+                if placement.is_replicate():
+                    factor *= mesh.size(i)
+            return factor
+        return float(self.ddp_world_size)
 
     def _get_attention_params(self, layer) -> List[torch.nn.Parameter]:
         """Get all parameters for the attention block of a layer."""
@@ -605,13 +634,18 @@ class LayerDiagnostics:
                     self._snapshot_block(f'layer_{i}_ffn_w2', self._get_ffn_w2_params(layer), device)
 
     def _snapshot_block(self, key: str, params: List[torch.nn.Parameter], device: str):
-        """Clone param data and record local w_norm² + global numel for a single block."""
+        """Clone param data and record local w_norm² + global numel for a single block.
+
+        Contributions are divided by _replication_factor: ROOT-group params
+        (out/emb/norm) are unsharded full tensors on every rank, and without the
+        divisor their param_delta_norm/update_rms came out sqrt(world_size)
+        inflated (found 2026-07-13; the layer DTensors were always correct here)."""
         clones = []
         w_norm_sq = torch.tensor(0.0, device=device)
         for p in params:
             local = self._get_local_data(p)
             clones.append(local.detach().clone())
-            w_norm_sq += local.detach().float().pow(2).sum()
+            w_norm_sq += local.detach().float().pow(2).sum() / self._replication_factor(p)
         self._weight_snapshots[key] = (params, clones)
         self._snapshot_w_norm_sq[key] = w_norm_sq
         self._snapshot_numel[key] = self._block_numel(params)
@@ -638,7 +672,8 @@ class LayerDiagnostics:
             delta_sq = torch.tensor(0.0, device=device)
             for p, clone in zip(params, clones):
                 local = self._get_local_data(p)
-                delta_sq += (local.detach().float() - clone.float()).pow(2).sum()
+                delta_sq += ((local.detach().float() - clone.float()).pow(2).sum()
+                             / self._replication_factor(p))
             local_vals[i * 2] = delta_sq
             local_vals[i * 2 + 1] = self._snapshot_w_norm_sq[key]
 
@@ -885,10 +920,13 @@ class LayerDiagnostics:
             # Convert to JSON-serializable dict
             data = {
                 'step': snapshot.step,
-                # norm_v 2 = w_norm/g_norm/w_rms computed from local shards (single
-                # reduction). Unstamped lines predate the sqrt(world_size) inflation
-                # fix; tools/fix_diagnostics_norms.py rescales exactly those.
-                'norm_v': 2,
+                # norm_v 3 = replication-aware reductions everywhere: v2 fixed the
+                # DTensor global-sum double-count (layer norms) but missed FSDP2
+                # ROOT-group params (out/emb are unsharded full tensors on every
+                # rank), which kept w_norm/param_delta_norm/update_rms inflated by
+                # sqrt(world_size) for exactly those blocks. Unstamped and v2 lines
+                # are retro-rescaled by tools/fix_diagnostics_norms.py.
+                'norm_v': 3,
                 'total_tokens': snapshot.total_tokens,
                 'tok_embeddings': self._block_to_dict(snapshot.tok_embeddings),
                 'output': self._block_to_dict(snapshot.output) if snapshot.output else None,
