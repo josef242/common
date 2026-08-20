@@ -642,6 +642,9 @@ def load_model_and_tokenizer(
     # is long gone.
     _ckpt_rope_fixed = chk_meta.get("rope_fixed", None)
     _ckpt_version = chk_meta.get("checkpoint_version", "2.0")
+    _ckpt_cfg_dict = chk_meta.get("config", None)
+    _ckpt_rope_mode = (_ckpt_cfg_dict.get("rope_mode", "rope")
+                       if isinstance(_ckpt_cfg_dict, dict) else "rope")
 
     del chk_meta  # Free memory, will be reloaded in _build_model_from_checkpoint
 
@@ -707,6 +710,23 @@ def load_model_and_tokenizer(
         f"[rope] {'LEGACY/corrupted' if envelope_compat else 'FIXED'} RoPE "
         f"({_rope_src}; ckpt rope_fixed={_ckpt_rope_fixed}, v{_ckpt_version}). "
         f"Override with {'--fixed_rope' if envelope_compat else '--envelope_compat'}.")
+    if _ckpt_rope_mode != "rope":
+        # PE-ablation checkpoint (rope_mode knob, 2026-07-30): the filter-based
+        # rebuild already constructed its NATIVE tables via ModelArgs.rope_mode
+        # (identity for nope, cos-envelope for envelope). The envelope-compat
+        # surgery below exists for PRE-FIX standard-RoPE checkpoints only —
+        # applied here it would clobber deliberate tables (on an envelope-mode
+        # model, sin <- cloned zero cos zeroes BOTH tables). Suppress it,
+        # including forced --envelope_compat.
+        if envelope_compat:
+            logger.print_and_log(
+                f"[rope] envelope-compat suppressed: checkpoint carries "
+                f"rope_mode={_ckpt_rope_mode!r} and its native tables are already built.")
+        else:
+            logger.print_and_log(
+                f"[rope] PE-ablation checkpoint: rope_mode={_ckpt_rope_mode!r} — "
+                f"native tables built at construction.")
+        envelope_compat = False
     if envelope_compat:
         # Legacy-faithful RoPE: every FSDP2 checkpoint trained before the
         # 2026-07-02 meta-init fix learned under CORRUPTED tables (to_empty()
@@ -1032,6 +1052,13 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
     if spec is True and _mtp_mod is None:
         raise ValueError("spec=True requires an MTP checkpoint (model.mtp is None)")
     use_spec = (_mtp_mod is not None) if spec is None else (bool(spec) and _mtp_mod is not None)
+    # Delta trunks (2026-08-03): spec decode is supported via recurrent-state
+    # snapshot/rollback (KDA_SPEC_DECODE_ROLLBACK) — snapshot at each anchor,
+    # restore + single-row replay on reject. Log so the mode is visible.
+    if use_spec and getattr(model.params, 'gdn_enabled', False):
+        logger.print_and_log(
+            "[spec] delta-rule trunk: state snapshot/rollback ACTIVE "
+            "(anchor snapshots, reject = restore + 1-row replay).")
 
     # 1. Prepare Tokens
     tokens = tokenizer.encode(prompt_text, bos=True, eos=False)
@@ -1157,6 +1184,12 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
             # Leave >=1 token to forward (need fresh logits to sample from;
             # also handles new-prompt-is-strict-prefix, e.g. /rep truncation).
             start_pos = min(prefix_len, prompt_len - 1)
+            # Delta trunks: recurrent state can't seek — cross-turn reuse is
+            # only sound if the new start continues the state EXACTLY;
+            # otherwise full re-prefill (state rebuilds from 0).
+            if getattr(model.params, 'gdn_enabled', False) \
+                    and start_pos != getattr(model, '_fla_cache_pos', 0):
+                start_pos = 0
             # SWA rolling rings: REWIND re-entry (start_pos behind the ledger's
             # high-water mark) is UNSOUND once any ring has wrapped — slots for
             # evicted positions hold FUTURE-position K/V (RoPE-baked), so both
@@ -1361,6 +1394,9 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
                         break
 
                     spec_rounds += 1
+                    # Delta trunks: the 2-token chunk advances recurrent state
+                    # past the (possibly rejected) draft — snapshot the anchor.
+                    _dsnap = model.snapshot_delta_state()
                     chunk = torch.tensor([[cur, draft]], dtype=torch.long, device=device)
                     logits2, h_pre2 = model.generate_forward(chunk, n_ctx, return_h_pre=True)
                     p1 = _warp_probs(logits2[0, 0].float(), temperature, top_p)
@@ -1403,6 +1439,14 @@ def stream_generate_kv(model, tokenizer, prompt_text, max_new_tokens, context_si
                         model._mtp_cache_len = n_ctx + 1
                         q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
                         draft = int(torch.multinomial(q_probs, 1)) if temperature > 0 else int(q_probs.argmax())
+                        if _dsnap is not None:
+                            # Rewind delta state to the anchor, then replay the
+                            # ACCEPTED row only (cur @ n_ctx) — state lands at
+                            # n_ctx+1 exactly as the KV/ledger accounting does.
+                            # The replay also overwrites the phantom KV row.
+                            model.restore_delta_state(_dsnap)
+                            model.generate_forward(
+                                torch.tensor([[cur]], dtype=torch.long, device=device), n_ctx)
                         n_ctx += 1
                         cur = tok_v
 
@@ -1795,6 +1839,7 @@ def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
                 stop_reason = "eos"
                 break
             rounds += 1
+            _dsnap = model.snapshot_delta_state()   # delta trunks: anchor (None otherwise)
             chunk = torch.tensor([[cur, draft]], dtype=torch.long, device=device)
             logits2, h_pre2 = model.generate_forward(chunk, n_ctx, return_h_pre=True)
             p1 = _warp_probs(logits2[0, 0].float(), temperature, top_p)
@@ -1859,6 +1904,11 @@ def spec_generate(model, tokenizer, prompt_text, max_new_tokens, context_size,
                 mtp_logits = model.mtp_decode_chunk(h_pre2[:, :1], nt, n_ctx)
                 q_probs = _warp_probs(mtp_logits[0, -1].float(), temperature, top_p)
                 draft = _sample(q_probs)
+                if _dsnap is not None:
+                    # delta rollback: anchor restore + accepted-row replay
+                    model.restore_delta_state(_dsnap)
+                    model.generate_forward(
+                        torch.tensor([[cur]], dtype=torch.long, device=device), n_ctx)
                 n_ctx += 1
                 cur = tok_v
 

@@ -31,7 +31,105 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 import torch._dynamo
-from contextlib import nullcontext
+import time
+from contextlib import nullcontext, contextmanager
+
+# MARA_OFFLOAD_DEBUG=1: log any pinned-buffer acquisition slower than 0.5s —
+# discriminates offload-side host stalls from external ones (NAS shard
+# fetches etc.) when hunting intermittent multi-second steps.
+_OFFLOAD_DEBUG = os.environ.get("MARA_OFFLOAD_DEBUG") == "1"
+
+
+class _ActOffloader:
+    """Saved-tensor offload to pinned host RAM (rig-30 perf campaign 2026-08-05).
+
+    One mechanism, two pools. Wrapped around an AC'd block, autograd only
+    saves the checkpoint's boundary inputs -> those are what get offloaded
+    (Pool A: frees ~B*T*embd per layer of VRAM for ~9ms of PCIe). Wrapped
+    around a NON-checkpointed block, autograd saves every intermediate ->
+    all of them ride to host and that block's backward recompute vanishes
+    (Pool B: ~110ms/layer round trip). Which blocks get which is decided by
+    Transformer.__init__ from ac_skip_layers/ac_input_offload/ac_offload.
+
+    Mechanics: D2H copies run on a dedicated per-device stream that first
+    waits on the compute stream; the source tensor is record_stream()'d so
+    the caching allocator defers reuse until the copy lands. Backward
+    demand-fetches: unpack synchronizes the pack event (a no-op that late),
+    H2D's on the copy stream, and makes the compute stream wait on the copy
+    event. Non-CUDA tensors and anything under min_bytes pass through.
+    """
+
+    def __init__(self, min_bytes: int):
+        self.min_bytes = int(min_bytes)
+        self._streams: dict = {}
+        # Persistent pinned-buffer pool keyed by (shape, dtype). v1 allocated
+        # fresh pinned buffers per pack and freed them per backward — the
+        # resulting cudaHostAlloc/cudaFreeHost storms (FreeHost implicitly
+        # device-syncs) produced periodic ~150s stalls every few steps
+        # (Josef spotted the period, 2026-08-05). Buffers now live for the
+        # run: steady state does ZERO host allocation. Reuse safety comes
+        # from copy-stream ordering — a buffer returns to the pool at unpack
+        # after its H2D is ISSUED on the copy stream, and any later D2H
+        # reusing it is issued on that same stream, so the hardware serializes
+        # them; no host-side wait needed.
+        self._pool: dict = {}
+
+    def _stream(self, dev):
+        s = self._streams.get(dev)
+        if s is None:
+            s = torch.cuda.Stream(device=dev)
+            self._streams[dev] = s
+        return s
+
+    def _get_buf(self, t):
+        key = (tuple(t.shape), t.dtype)
+        lst = self._pool.get(key)
+        if lst:
+            return key, lst.pop()
+        return key, torch.empty_like(t, device="cpu", pin_memory=True)
+
+    @torch.compiler.disable
+    def _pack(self, t):
+        if (not t.is_cuda) or t.numel() * t.element_size() < self.min_bytes:
+            return t
+        _t0 = time.perf_counter() if _OFFLOAD_DEBUG else 0.0
+        key, cpu = self._get_buf(t)
+        if _OFFLOAD_DEBUG:
+            _dt = time.perf_counter() - _t0
+            if _dt > 0.5:
+                print(f"[act-offload][DEBUG] slow pinned get_buf: {_dt:.2f}s for "
+                      f"{key[0]} pool_sizes={{k: len(v) for k, v in self._pool.items()}}",
+                      flush=True)
+        s = self._stream(t.device)
+        s.wait_stream(torch.cuda.current_stream(t.device))
+        with torch.cuda.stream(s):
+            cpu.copy_(t, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(s)
+        t.record_stream(s)
+        return (key, cpu, t.device, ev)
+
+    @torch.compiler.disable
+    def _unpack(self, packed):
+        if isinstance(packed, torch.Tensor):
+            return packed
+        key, cpu, dev, ev = packed
+        ev.synchronize()  # D2H landed (fwd-era event; effectively free here)
+        s = self._stream(dev)
+        with torch.cuda.stream(s):
+            gpu = cpu.to(dev, non_blocking=True)
+            ev2 = torch.cuda.Event()
+            ev2.record(s)
+        cur = torch.cuda.current_stream(dev)
+        cur.wait_event(ev2)
+        gpu.record_stream(cur)
+        self._pool.setdefault(key, []).append(cpu)  # stream-ordered reuse
+        return gpu
+
+    @contextmanager
+    def hooks(self):
+        with torch.autograd.graph.saved_tensors_hooks(self._pack, self._unpack):
+            yield
 
 
 def _in_backward_recompute() -> bool:
@@ -72,8 +170,84 @@ except Exception:
         return F.cross_entropy(logits, targets, reduction=reduction, ignore_index=ignore_index)
 
 
+# ── F9 op-level SAC (2026-08-17) ─────────────────────────────────────────────
+# Selective activation checkpointing policy for the block checkpoint. The
+# 'flex_save' policy MUST_SAVEs flex/scaled-dot-product attention outputs
+# (the quadratic recompute, ~105MB/attn-layer at production shape) and
+# PREFER_RECOMPUTEs everything else. MARA_SAC_DEBUG=1 prints each distinct op
+# the policy sees ONCE (rank-local) — the reachability probe for whether the
+# per-submodule-compile structure exposes the target ops to the dispatch mode.
+_SAC_SEEN_OPS: set = set()
+
+
+def _make_sac_context_fn(policy_name: str):
+    from functools import partial
+    from torch.utils.checkpoint import (
+        create_selective_checkpoint_contexts, CheckpointPolicy)
+
+    _debug = os.environ.get('MARA_SAC_DEBUG') == '1'
+
+    def _policy_fn(ctx, op, *args, **kwargs):
+        name = str(getattr(op, '__name__', op))
+        if _debug and name not in _SAC_SEEN_OPS:
+            _SAC_SEEN_OPS.add(name)
+            print(f"[SAC-DEBUG] op: {name}", flush=True)
+        if policy_name == 'flex_save':
+            if ('flex_attention' in name
+                    or 'scaled_dot_product' in name):
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return partial(create_selective_checkpoint_contexts, _policy_fn)
+
+
+# PERF_CAMPAIGN F1 (2026-08-13): precomputed CCE valids. The library's
+# _build_flat_valids calls aten::nonzero on the GPU targets; its data-dependent
+# output shape forces a full pipeline drain (~2.9s/call, 6 calls/step,
+# trace-attributed). The valids depend ONLY on targets+ignore_index, so the
+# train loop builds them on the CPU batch (cpu nonzero = no GPU sync) and
+# ships them async. `_CCE_VALIDS_ABSENT` distinguishes "not provided" from a
+# legitimate None (= all tokens valid).
+_CCE_VALIDS_ABSENT = object()
+
+
+def cce_cpu_valids(targets_cpu: torch.Tensor, ignore_index: int):
+    """CPU twin of cut_cross_entropy.utils._build_flat_valids for shift=0.
+    Returns int32 flat indices of valid targets, or None if all are valid."""
+    t = targets_cpu.reshape(-1)
+    v = (t != ignore_index).nonzero().to(torch.int32)
+    return v.squeeze(1) if v.numel() != t.numel() else None
+
+
+def _cce_loss_with_valids(hidden, weight, targets, valids, *,
+                          accum_e_fp32=False, accum_c_fp32=False,
+                          reduction="mean"):
+    """Vendored tail of cut_cross_entropy.cce.cce_linear_cross_entropy
+    (25.4.3) minus the _build_flat_valids call — byte-identical math, valids
+    supplied by the caller. shift=0 / bias=None / softcap=None only (the only
+    forms our hot path uses)."""
+    from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
+    from cut_cross_entropy.utils import _handle_eps
+    assert hidden.size()[0:-1] == targets.size()
+    e = hidden.contiguous()
+    t = targets.contiguous()
+    batch_shape = t.size()
+    e = e.flatten(0, -2)
+    t = t.flatten()
+    if (t.data_ptr() % 16) != 0:
+        t = torch.nn.functional.pad(t, (0, 1))[:-1]
+    assert (t.data_ptr() % 16) == 0
+    params = CCEParams(
+        t, valids, None, reduction, _handle_eps("auto", e.dtype), 0,
+        batch_shape, accum_e_fp32, accum_c_fp32,
+        filter_e_grad=True, filter_c_grad=True, vocab_parallel_options=None,
+    )
+    return linear_cross_entropy_apply(e, weight, None, params)
+
+
 @torch._dynamo.disable
-def cce_loss(hidden, weight, targets, **kwargs):
+def cce_loss(hidden, weight, targets, valids=_CCE_VALIDS_ABSENT, **kwargs):
     """Thin wrapper so CCE executes in eager mode.
 
     PROBE HOOK (env WD_CCE_IMPL): override the CCE implementation. The default fused
@@ -85,6 +259,18 @@ def cce_loss(hidden, weight, targets, **kwargs):
     _impl = os.environ.get('WD_CCE_IMPL')
     if _impl and 'impl' not in kwargs:
         kwargs = dict(kwargs, impl=_impl)
+    if valids is not _CCE_VALIDS_ABSENT and _use_lce and 'impl' not in kwargs:
+        # F1 fast path: caller-supplied valids skip the library's GPU nonzero.
+        # CONTRACT (review note 2026-08-16): the fast path DROPS ignore_index —
+        # the caller's valids MUST have been built against the same ignore id
+        # this call site would pass (today: params.pad_id on both ends). A
+        # future call site with a different ignore_index must NOT pass valids.
+        return _cce_loss_with_valids(
+            hidden, weight, targets, valids,
+            accum_e_fp32=kwargs.get('accum_e_fp32', False),
+            accum_c_fp32=kwargs.get('accum_c_fp32', False),
+            reduction=kwargs.get('reduction', 'mean'),
+        )
     return linear_cross_entropy(hidden, weight, targets, **kwargs)
 
 
@@ -252,13 +438,27 @@ except ImportError:
 
 
 # ----------------------------------------------------------------------------
-# Gated DeltaNet (FLA library, optional)
+# Gated DeltaNet / Kimi Delta Attention (FLA library, optional)
 # ----------------------------------------------------------------------------
-_GatedDeltaNet = None  # Lazy-loaded when gdn_enabled=True
+_GatedDeltaNet = None       # Lazy-loaded when gdn_enabled=True, gdn_impl='gdn'
+_KimiDeltaAttention = None  # Lazy-loaded when gdn_enabled=True, gdn_impl='kda'
 
 
-def _try_import_gdn():
-    global _GatedDeltaNet
+def _try_import_gdn(impl: str = 'gdn'):
+    global _GatedDeltaNet, _KimiDeltaAttention
+    if impl == 'kda':
+        if _KimiDeltaAttention is not None:
+            return
+        try:
+            from fla.layers import KimiDeltaAttention
+            _KimiDeltaAttention = KimiDeltaAttention
+        except ImportError:
+            raise ImportError(
+                "gdn_impl='kda' requires an FLA version that ships "
+                "fla.layers.KimiDeltaAttention (Kimi Linear / K3 family). "
+                "Install: pip install -U git+https://github.com/fla-org/flash-linear-attention"
+            )
+        return
     if _GatedDeltaNet is not None:
         return
     try:
@@ -269,6 +469,13 @@ def _try_import_gdn():
             "GDN hybrid attention requires the FLA library. "
             "Install: pip install -U git+https://github.com/fla-org/flash-linear-attention"
         )
+
+
+def _new_fla_cache():
+    """One FLA Cache per generation, shared by every delta-rule layer (each
+    layer indexes it via its compacted _fla_cache_idx — see Transformer.__init__)."""
+    from fla.models.utils import Cache
+    return Cache()
 
 
 # ----------------------------------------------------------------------------
@@ -361,12 +568,47 @@ class ModelArgs:
     dropout: float = 0.0
     pad_id: int = 0
     use_activation_checkpointing: bool = True
+    # ── Activation-memory levers (2026-08-05 rig-30 perf campaign). All are
+    # RUNTIME perf knobs — resume-safe, deliberately absent from the resume
+    # structural-guard triples. Default-off = byte-identical behavior. ──
+    #   ac_skip_layers    — skip checkpointing on N evenly-striped blocks:
+    #                       their recompute vanishes; intermediates cost VRAM
+    #                       unless ac_offload ships them to host.
+    #   ac_input_offload  — Pool A: offload the AC'd blocks' checkpoint
+    #                       boundary inputs (~B*T*embd each) to pinned host
+    #                       RAM. Frees VRAM (→ larger B) for ~9ms/layer PCIe.
+    #   ac_offload        — Pool B: offload the AC-skipped blocks' full saved
+    #                       intermediates (~110ms/layer PCIe round trip).
+    #   ac_offload_min_mb — per-tensor floor; smaller saves stay on-device.
+    ac_skip_layers: int = 0
+    ac_input_offload: bool = False
+    #   ac_input_offload_layers — partial Pool A (2026-08-07, born the night
+    #     the RAM swap beeped): offload boundary inputs of only N evenly-
+    #     striped blocks; the rest keep plain-AC behavior (input stays in
+    #     VRAM). Trades pinned-host (N x B*T*embd per rank) against VRAM
+    #     ((L-N) x same). 0 = all AC'd blocks (historical Pool A behavior).
+    ac_input_offload_layers: int = 0
+    ac_offload: bool = False
+    ac_offload_min_mb: int = 8
+    #   ac_sac_policy — F9 op-level SAC: None | 'flex_save' (save attention
+    #     outputs inside the block checkpoint, recompute the rest).
+    ac_sac_policy: str = None
     # QK-Norm Mode: None | "before_rope" | "after_rope_legacy"
     qk_norm_mode: Optional[str] = None
     # Tie input embeddings and output LM head weights
     tie_word_embeddings: bool = True
     # RoPE base frequency (higher = longer context support)
     rope_theta: float = 500000.0
+    # Positional-encoding mode for the attention Q/K path (PE ablation 2026-07-30):
+    #   "rope"     — standard rotary embedding (default; behavior unchanged)
+    #   "nope"     — no positional encoding: identity tables (cos=1, sin=0) make
+    #                apply_rotary_emb an exact no-op; position is inferable only
+    #                through the causal mask
+    #   "envelope" — deliberate reproduction of the pre-2026-07-02 meta-init
+    #                corruption (cos=0, sin=cos-table): per-channel attention
+    #                scores become (q·k)·cos(p·θ)·cos(m·θ), a separable
+    #                positional envelope with no clean relative rotation
+    rope_mode: str = "rope"
     # KEEL (Highway-style Post-LN) configuration
     # Paper: "Post-LayerNorm Is Back: Stable, Expressive, and Deep" (arXiv:2601.19895)
     use_keel: bool = False
@@ -393,12 +635,26 @@ class ModelArgs:
     moe_shared_overlap: bool = False       # overlap shared_experts with EP on a side CUDA stream
     # Gated DeltaNet (GDN) hybrid attention configuration
     gdn_enabled: bool = False              # enable GDN hybrid attention
+    gdn_impl: str = 'gdn'                  # 'gdn' = FLA GatedDeltaNet | 'kda' = FLA
+                                           # KimiDeltaAttention (Kimi Linear / K3 family:
+                                           # channel-wise decay instead of per-head scalar)
     gdn_interleave_step: int = 4           # every Nth layer is full-attention, rest are GDN
+    gdn_n_tail_global: int = 1             # FORCE the last N layers global regardless of
+                                           # interleave (K3 guarantees a global final layer —
+                                           # the LM head must not decode from a delta layer's
+                                           # ~100-token local summary). 0 = pure interleave.
+                                           # >1 = experiment knob for multi-global tails
+                                           # (KEEL denormalizing-tail interaction).
     n_gdn_heads: Optional[int] = None      # GDN head count (None = same as n_heads)
-    gdn_head_dim: Optional[int] = None     # GDN q/k head dim (None = 256, FLA default)
-    gdn_v_expand: float = 2.0             # value expansion ratio (v_dim = head_dim * expand)
+    gdn_head_dim: Optional[int] = None     # q/k head dim (None = impl default: 256 gdn / 128 kda)
+    gdn_v_expand: Optional[float] = None   # value expansion ratio (None = impl default:
+                                           # 2.0 gdn / 1.0 kda, matching each paper)
     gdn_short_conv_kernel: int = 4         # short convolution kernel size
     gdn_mode: str = 'chunk'                # FLA mode: 'chunk' (training) or 'fused_recurrent'
+    # KDA-only knobs (K3's lower-bounded log-decay; ignored for gdn_impl='gdn'):
+    kda_safe_gate: bool = True             # bounded decay parameterization (K3) vs
+                                           # Kimi-Linear negative-softplus (unbounded)
+    kda_lower_bound: float = -5.0          # K3 g_min: log-decay bounded to (g_min, 0)
     # Attention Residuals (AttnRes) — learned depth-wise attention over block representations
     # Paper: "Attention Residuals" — Kimi Team (2026)
     attn_res_enabled: bool = False         # enable Block AttnRes
@@ -484,6 +740,25 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
     return freqs_cos, freqs_sin
 
 
+def compute_rope_tables(dim: int, end: int, theta: float, rope_mode: str = "rope"):
+    """Positional tables keyed by rope_mode — single source of truth for
+    Transformer.__init__, init_weights, and the trainer's [freqs-check] rail.
+
+    "nope" is EXACTLY the identity through apply_rotary_emb (cos=1, sin=0; the
+    fp32 round-trip of bf16 inputs is value-preserving, so scores reduce to raw
+    q·k). "envelope" reproduces the pre-2026-07-02 meta-init corruption
+    deterministically (cos = zero pages, sin = the recycled cos block)."""
+    freqs_cos, freqs_sin = precompute_freqs_cis(dim, end, theta)
+    if rope_mode == "rope":
+        return freqs_cos, freqs_sin
+    if rope_mode == "nope":
+        return torch.ones_like(freqs_cos), torch.zeros_like(freqs_sin)
+    if rope_mode == "envelope":
+        return torch.zeros_like(freqs_cos), freqs_cos
+    raise ValueError(
+        f"unknown rope_mode {rope_mode!r} — expected 'rope' | 'nope' | 'envelope'")
+
+
 
 """ Some debate about use of complex numbers for RoPE
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -567,6 +842,26 @@ def doc_ids_from_tokens(tokens: torch.Tensor, bos_id: int) -> torch.Tensor:
     a window's first BOS are the tail of a document cut by the window boundary
     and share doc id 0."""
     return (tokens == bos_id).cumsum(dim=-1, dtype=torch.int32)
+
+
+def doc_cu_seqlens(tokens: torch.Tensor, bos_id: int) -> torch.Tensor:
+    """Flattened-varlen boundaries for delta-rule (KDA/GDN) doc state resets.
+
+    [B, S] tokens -> int32 cu_seqlens in FLA's flash-varlen convention: the
+    batch is viewed as ONE flattened [1, B*S] sequence and cu_seqlens marks
+    every segment start (plus the final total). Boundaries are placed at every
+    ROW start (rows are independent packed windows — in normal [B, S] mode the
+    recurrent state is per-row by construction, so row-start boundaries make
+    the flattened form exactly equivalent) and at every BOS (the doc reset this
+    exists for). A BOS sitting at a row start coincides with the row boundary
+    and is naturally deduplicated by the boolean mask.
+    See docs/KDA_VARLEN_DOC_RESET.md."""
+    B, S = tokens.shape
+    is_start = (tokens == bos_id).reshape(-1).clone()
+    is_start[0::S] = True
+    idx = is_start.nonzero(as_tuple=True)[0].to(torch.int32)
+    total = torch.tensor([B * S], dtype=torch.int32, device=tokens.device)
+    return torch.cat([idx, total])
 
 
 def doc_position_ids(tokens: torch.Tensor, bos_id: int) -> torch.Tensor:
@@ -1517,7 +1812,9 @@ class TransformerBlock(nn.Module):
         self.use_gdn = False
         if getattr(args, 'gdn_enabled', False):
             gdn_step = getattr(args, 'gdn_interleave_step', 4)
-            self.use_gdn = (layer_id % gdn_step != gdn_step - 1)
+            _tail_global = getattr(args, 'gdn_n_tail_global', 1)
+            self.use_gdn = (layer_id % gdn_step != gdn_step - 1) \
+                and (layer_id < args.n_layers - _tail_global)
 
         # SWA hybrid: LOCAL (windowed) unless this is a global layer — same
         # interleave convention as GDN (every Nth layer, at step-1 offsets, is
@@ -1528,21 +1825,47 @@ class TransformerBlock(nn.Module):
             self.swa_local = (layer_id % _swa_step != _swa_step - 1)
 
         if self.use_gdn:
-            _try_import_gdn()
+            _impl = getattr(args, 'gdn_impl', 'gdn')
+            _try_import_gdn(_impl)
             n_gdn_heads = getattr(args, 'n_gdn_heads', None) or args.n_heads
-            gdn_head_dim = getattr(args, 'gdn_head_dim', None) or 256
-            self.gdn_attn = _GatedDeltaNet(
-                hidden_size=args.dim,
-                num_heads=n_gdn_heads,
-                head_dim=gdn_head_dim,
-                expand_v=getattr(args, 'gdn_v_expand', 2.0),
-                conv_size=getattr(args, 'gdn_short_conv_kernel', 4),
-                mode=getattr(args, 'gdn_mode', 'chunk'),
-                use_gate=True,
-                use_short_conv=True,
-                layer_idx=layer_id,
-                norm_eps=args.norm_eps,
-            )
+            # Per-impl defaults track each paper: GDN 256/2.0, KDA (Kimi Linear
+            # / K3) 128/1.0. Explicit config values always win.
+            gdn_head_dim = getattr(args, 'gdn_head_dim', None) or (128 if _impl == 'kda' else 256)
+            gdn_v_expand = getattr(args, 'gdn_v_expand', None) or (1.0 if _impl == 'kda' else 2.0)
+            if _impl == 'kda':
+                # layer_idx is provisional here — Transformer.__init__ rewrites
+                # it to a COMPACTED index (see the fla-cache-idx pass) so a
+                # shared FLA Cache stays densely indexed by delta-rule layers.
+                self.gdn_attn = _KimiDeltaAttention(
+                    hidden_size=args.dim,
+                    num_heads=n_gdn_heads,
+                    head_dim=gdn_head_dim,
+                    expand_v=gdn_v_expand,
+                    conv_size=getattr(args, 'gdn_short_conv_kernel', 4),
+                    mode=getattr(args, 'gdn_mode', 'chunk'),
+                    use_short_conv=True,
+                    safe_gate=getattr(args, 'kda_safe_gate', True),
+                    # lower_bound only participates in the safe_gate path; the
+                    # Kimi-Linear negative-softplus path (safe_gate=False) is
+                    # unbounded by construction.
+                    lower_bound=(getattr(args, 'kda_lower_bound', -5.0)
+                                 if getattr(args, 'kda_safe_gate', True) else None),
+                    layer_idx=layer_id,
+                    norm_eps=args.norm_eps,
+                )
+            else:
+                self.gdn_attn = _GatedDeltaNet(
+                    hidden_size=args.dim,
+                    num_heads=n_gdn_heads,
+                    head_dim=gdn_head_dim,
+                    expand_v=gdn_v_expand,
+                    conv_size=getattr(args, 'gdn_short_conv_kernel', 4),
+                    mode=getattr(args, 'gdn_mode', 'chunk'),
+                    use_gate=True,
+                    use_short_conv=True,
+                    layer_idx=layer_id,
+                    norm_eps=args.norm_eps,
+                )
         else:
             # Full attention (with gate if in GDN hybrid mode)
             use_gate = getattr(args, 'gdn_enabled', False)
@@ -1570,6 +1893,15 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.use_activation_checkpointing = args.use_activation_checkpointing
+        # Per-layer overrides, set by Transformer.__init__ (ac_skip_layers /
+        # ac_input_offload / ac_offload). Defaults reproduce historical
+        # behavior exactly: checkpoint iff the global flag, no offload.
+        self.ac_checkpoint = args.use_activation_checkpointing
+        # F9 op-level SAC (2026-08-17): selective policy inside the block
+        # checkpoint — save named-expensive outputs (flex attention), recompute
+        # the cheap tissue. None = plain checkpoint, byte-identical legacy.
+        self.ac_sac_policy = getattr(args, 'ac_sac_policy', None)
+        self._act_offloader = None
 
         # KEEL: Highway-style Post-LN configuration
         self.use_keel = getattr(args, 'use_keel', False)
@@ -1584,11 +1916,17 @@ class TransformerBlock(nn.Module):
         """Route through MoE or dense FeedForward."""
         return self.moe(x) if self.moe_enabled else self.feed_forward(x)
 
-    def _attn(self, x, freqs_cos, freqs_sin, block_mask=None):
+    def _attn(self, x, freqs_cos, freqs_sin, block_mask=None, doc_cu=None):
         """Route through GDN or softmax attention."""
         if self.use_gdn:
-            # GDN has no doc masking (recurrent state crosses documents);
-            # Settings fatals when doc_attn_mask is combined with gdn_enabled.
+            if doc_cu is not None:
+                # Doc-confined training: FLA varlen resets the recurrent state
+                # (and the ShortConv receptive field) at every cu boundary —
+                # the delta-rule analog of the softmax layers' BlockMask.
+                # flash-varlen convention: batch flattened to [1, B*S].
+                B, S, D = x.shape
+                out, *_ = self.gdn_attn(x.reshape(1, B * S, D), cu_seqlens=doc_cu)
+                return out.reshape(B, S, D)
             out, *_ = self.gdn_attn(x)
             return out
         if isinstance(block_mask, tuple):
@@ -1596,51 +1934,67 @@ class TransformerBlock(nn.Module):
             block_mask = block_mask[1] if self.swa_local else block_mask[0]
         return self.attention(x, freqs_cos, freqs_sin, block_mask)
 
-    def _forward_block(self, x, freqs_cos, freqs_sin, block_mask=None):
+    def _forward_block(self, x, freqs_cos, freqs_sin, block_mask=None, doc_cu=None):
         """Inner forward for activation checkpointing."""
         if self.use_keel:
             if self.layer_id == 0:
                 # First block: standard Pre-LN (no Post-LN, no alpha scaling)
-                h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask)
+                h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask, doc_cu)
                 out = h + self._ffn(self.ffn_norm(h))
             else:
                 # KEEL: x_{l+1} = LN(alpha * x_l + F_l(LN(x_l)))
-                attn_out = self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask)
+                attn_out = self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask, doc_cu)
                 h = self.post_attn_norm(self.keel_alpha * x + attn_out)
                 ffn_out = self._ffn(self.ffn_norm(h))
                 out = self.post_ffn_norm(self.keel_alpha * h + ffn_out)
         else:
             # Original Pre-LN path (unchanged)
-            h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask)
+            h = x + self._attn(self.attention_norm(x), freqs_cos, freqs_sin, block_mask, doc_cu)
             out = h + self._ffn(self.ffn_norm(h))
         return out
 
-    def forward(self, x, freqs_cos, freqs_sin, block_mask=None):
+    def forward(self, x, freqs_cos, freqs_sin, block_mask=None, doc_cu=None):
         """
         TRAINING PATH - Uses activation checkpointing when enabled.
         """
-        if self.use_activation_checkpointing and self.training:
-            # Non-reentrant checkpoint passes non-tensor args (BlockMask) through
-            # to the recompute untouched; its int tensors need no grad tracking.
-            out = cp.checkpoint(self._forward_block, x, freqs_cos, freqs_sin, block_mask,
-                                use_reentrant=False)
-        else:
-            out = self._forward_block(x, freqs_cos, freqs_sin, block_mask)
+        _off = self._act_offloader if self.training else None
+        with (_off.hooks() if _off is not None else nullcontext()):
+            if self.ac_checkpoint and self.training:
+                # Non-reentrant checkpoint passes non-tensor args (BlockMask) through
+                # to the recompute untouched; its int tensors need no grad tracking.
+                # Under an offload context, only the checkpoint's boundary saves ride
+                # to host (the checkpoint's own inner hooks are innermost and still
+                # discard intermediates — Pool A).
+                _sac_kw = {}
+                if self.ac_sac_policy:
+                    _sac_kw['context_fn'] = _make_sac_context_fn(self.ac_sac_policy)
+                out = cp.checkpoint(self._forward_block, x, freqs_cos, freqs_sin, block_mask,
+                                    doc_cu, use_reentrant=False, **_sac_kw)
+            else:
+                # No checkpoint: every saved intermediate hits the hooks (Pool B
+                # when an offloader is attached; plain VRAM spend otherwise).
+                out = self._forward_block(x, freqs_cos, freqs_sin, block_mask, doc_cu)
         return out
 
-    def forward_with_cache(self, x, freqs_cos, freqs_sin, start_pos: int):
+    def forward_with_cache(self, x, freqs_cos, freqs_sin, start_pos: int, fla_cache=None):
         """
         INFERENCE PATH - No checkpointing, uses KV cache.
-        GDN layers use regular forward (no KV cache, recurrent state in FLA).
+        GDN/KDA layers thread their recurrent state through the shared FLA
+        Cache owned by Transformer.generate_forward (audit 2026-07-11 #2: the
+        old path discarded it, so every decode step after prefill saw a fresh
+        length-1 sequence).
         """
         # Move input to this block's device (for multi-GPU sharded models)
         device = next(self.parameters()).device
         if x.device != device:
             x = x.to(device)
 
-        # GDN: no KV cache, just forward pass
         if self.use_gdn:
-            attn_out, *_ = self.gdn_attn(self.attention_norm(x))
+            attn_out, _, _ = self.gdn_attn(
+                self.attention_norm(x),
+                past_key_values=fla_cache,
+                use_cache=fla_cache is not None,
+            )
         else:
             attn_out = self.attention.forward_with_cache(self.attention_norm(x), freqs_cos, freqs_sin, start_pos)
 
@@ -1719,7 +2073,59 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
-        
+
+        # ── Activation-memory levers (see ModelArgs comments; default-off =
+        # historical behavior). Skip set is evenly striped over depth so the
+        # recompute relief and the offload traffic spread across the forward
+        # instead of clumping. One shared offloader -> one copy stream per
+        # device, so D2H/H2D traffic serializes in issue order. ──
+        _n_skip = int(getattr(params, 'ac_skip_layers', 0) or 0)
+        _in_off = bool(getattr(params, 'ac_input_offload', False))
+        _sk_off = bool(getattr(params, 'ac_offload', False))
+        if _n_skip > 0 or _in_off:
+            _L = len(self.layers)
+            if _n_skip > _L:
+                raise ValueError(f"ac_skip_layers={_n_skip} > n_layers={_L}")
+            _skip = set()
+            if _n_skip > 0:
+                _skip = {int(round((k + 0.5) * _L / _n_skip)) for k in range(_n_skip)}
+                _skip = {min(i, _L - 1) for i in _skip}
+            _off = _ActOffloader(int(getattr(params, 'ac_offload_min_mb', 8)) * 1024 * 1024) \
+                if (_in_off or _sk_off) else None
+            # Partial Pool A: stripe the offload over N blocks (0 = all).
+            _n_inoff = int(getattr(params, 'ac_input_offload_layers', 0) or 0)
+            if _n_inoff > _L:
+                raise ValueError(f"ac_input_offload_layers={_n_inoff} > n_layers={_L}")
+            _inoff_set = None
+            if _in_off and _n_inoff > 0:
+                _inoff_set = {min(int(round((k + 0.5) * _L / _n_inoff)), _L - 1)
+                              for k in range(_n_inoff)}
+            for _i, _blk in enumerate(self.layers):
+                if _i in _skip:
+                    _blk.ac_checkpoint = False
+                    if _sk_off:
+                        _blk._act_offloader = _off
+                elif _in_off and _blk.ac_checkpoint and (_inoff_set is None or _i in _inoff_set):
+                    _blk._act_offloader = _off
+            self._ac_skip_set = _skip  # boot banner reads this
+            self._ac_inoff_count = (len(_inoff_set) if _inoff_set is not None
+                                    else (_L - len(_skip) if _in_off else 0))
+        else:
+            self._ac_skip_set = set()
+
+        # Delta-rule decode state (audit 2026-07-11 #2): one shared FLA Cache
+        # per generation threads each GDN/KDA layer's recurrent state across
+        # decode steps. FLA's cache helpers index by layer_idx and assume DENSE
+        # indices, but in the hybrid only some layers are delta-rule — so
+        # rewrite each delta layer's layer_idx to a compacted 0..K-1 sequence.
+        _fla_idx = 0
+        for _blk in self.layers:
+            if getattr(_blk, 'use_gdn', False):
+                _blk.gdn_attn.layer_idx = _fla_idx
+                _fla_idx += 1
+        self._fla_cache = None      # created at prefill (start_pos == 0)
+        self._fla_cache_pos = 0     # next position the recurrent state expects
+
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
@@ -1782,11 +2188,12 @@ class Transformer(nn.Module):
         if self.tie_word_embeddings:
             self.output.weight = self.tok_embeddings.weight
 
-        # Precompute RoPE frequencies
-        freqs_cos, freqs_sin = precompute_freqs_cis(
+        # Precompute positional tables (mode-aware: rope | nope | envelope)
+        freqs_cos, freqs_sin = compute_rope_tables(
             self.params.dim // self.params.n_heads,
             self.params.max_seq_len,
-            self.params.rope_theta
+            self.params.rope_theta,
+            getattr(self.params, 'rope_mode', 'rope'),
         )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
@@ -1819,12 +2226,19 @@ class Transformer(nn.Module):
         # strict ordering rather than registration tricks. Loss weight lives
         # trainer-side (z-loss pattern).
         if getattr(params, 'mtp_enabled', False):
-            if getattr(params, 'gdn_enabled', False):
-                raise RuntimeError(
-                    "mtp_enabled with gdn_enabled is unsupported (the MTP block's "
-                    "layer_id lands on the GDN interleave pattern and would become "
-                    "a recurrent block)")
+            # mtp × gdn SUPPORTED (2026-08-03, Wizard102 prep): the historical
+            # blocker was the MTP block's layer_id (= n_layers) landing on the
+            # GDN interleave and becoming recurrent. The gdn_n_tail_global
+            # condition (use_gdn &= layer_id < n_layers - tail) can never be
+            # true at layer_id = n_layers, so the readout head is structurally
+            # full-attention now. The assert pins that invariant against any
+            # future refactor of the interleave logic. NOTE: self-speculative
+            # decode with a delta trunk needs recurrent-state snapshot/rollback
+            # (spec rewinds; KDA state cannot seek) — handled in neo_common's
+            # spec engine, gated there.
             self.mtp = MTPModule(params)
+            assert not getattr(self.mtp.block, 'use_gdn', False), \
+                "MTP readout block must be full attention (interleave refactor broke the tail-global invariant?)"
             self.mtp.apply(self._init_weights)
             for _pn, _p in self.mtp.named_parameters():
                 if _pn.endswith('w3.weight') or _pn.endswith('wo.weight'):
@@ -1845,10 +2259,16 @@ class Transformer(nn.Module):
             if self.params.doc_attn_mask and flex_attention is None:
                 raise RuntimeError(
                     "doc_attn_mask requires torch >= 2.5 (torch.nn.attention.flex_attention)")
-            if getattr(self.params, 'gdn_enabled', False):
+            # doc_attn_mask × delta-rule is SUPPORTED (2026-07-31): KDA/GDN
+            # layers reset state at BOS via FLA varlen cu_seqlens — see
+            # docs/KDA_VARLEN_DOC_RESET.md. The trainer capability-gates the
+            # installed fla kernels. doc_pos_reset stays fatal: per-doc RoPE
+            # would apply to the softmax layers only, an asymmetric geometry
+            # no arm has validated.
+            if self.params.doc_pos_reset and getattr(self.params, 'gdn_enabled', False):
                 raise RuntimeError(
-                    "doc_attn_mask/doc_pos_reset are not supported with gdn_enabled "
-                    "(GDN recurrent state crosses document boundaries)")
+                    "doc_pos_reset is not supported with gdn_enabled (per-doc RoPE "
+                    "positions would affect only the hybrid's softmax layers)")
         if getattr(self.params, 'swa_enabled', False):
             if flex_attention is None:
                 raise RuntimeError(
@@ -1961,6 +2381,22 @@ class Transformer(nn.Module):
                     _db = module.dt_bias
                     _db.uniform_(math.log(1e-3), math.log(1e-1)).exp_().clamp_(min=1e-4)
                     _db.add_(torch.log(-torch.expm1(-_db)))
+            elif _KimiDeltaAttention is not None and isinstance(module, _KimiDeltaAttention):
+                # KDA (gdn_impl='kda'): same to_empty() hazard class. Recipe
+                # verified against fla/layers/kda.py 2026-07-30:
+                #   safe_gate: A_log = zeros (per-head log-scale, learned)
+                #   else:     A_log = log(U(1, 16))   (Kimi-Linear/GDN lineage)
+                #   dt_bias  = inv_softplus(clamp(exp(U(ln 1e-3, ln 1e-1)), min=1e-4))
+                # Child Linears/convs/norms re-init via their own branches.
+                _safe = getattr(module, 'safe_gate', getattr(self.params, 'kda_safe_gate', True))
+                with torch.no_grad():
+                    if _safe:
+                        module.A_log.zero_()
+                    else:
+                        module.A_log.uniform_(1.0, 16.0).log_()
+                    _db = module.dt_bias
+                    _db.uniform_(math.log(1e-3), math.log(1e-1)).exp_().clamp_(min=1e-4)
+                    _db.add_(torch.log(-torch.expm1(-_db)))
             elif module.__class__.__name__ in ('FusedRMSNormGated', 'FusedRMSNormSwishGate') \
                     and hasattr(module, 'reset_parameters'):
                 # GDN o_norm: FLA's gated norm class, invisible to the
@@ -2017,11 +2453,14 @@ class Transformer(nn.Module):
         # recycled cos block, i.e. attention scores degrade to a separable cos-envelope
         # instead of relative rotation (found 2026-07-02; every prior meta-init FSDP2 run
         # trained under that corruption). copy_() is a no-op when values are already
-        # correct, so non-meta construction paths are unaffected.
-        fc, fs = precompute_freqs_cis(
+        # correct, so non-meta construction paths are unaffected. Mode-aware:
+        # a nope/envelope arm must refill its OWN intended tables here, not
+        # standard RoPE (the [freqs-check] rail verifies against the same fn).
+        fc, fs = compute_rope_tables(
             self.params.dim // self.params.n_heads,
             self.params.max_seq_len,
             self.params.rope_theta,
+            getattr(self.params, 'rope_mode', 'rope'),
         )
         with torch.no_grad():
             self.freqs_cos.copy_(fc)
@@ -2212,6 +2651,44 @@ class Transformer(nn.Module):
         self._mtp_cache_len = 0
         self._cache_bsz = None
         self._cache_msl = None
+        # Delta-rule recurrent state shares the cache lifecycle.
+        self._fla_cache = None
+        self._fla_cache_pos = 0
+
+    # ----- Delta-state snapshot/rollback (spec decode; KDA_SPEC_DECODE_ROLLBACK) --
+    @staticmethod
+    def _clone_state_tree(o):
+        if torch.is_tensor(o):
+            return o.detach().clone()
+        if isinstance(o, dict):
+            return {k: Transformer._clone_state_tree(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            t = [Transformer._clone_state_tree(v) for v in o]
+            return t if isinstance(o, list) else tuple(t)
+        return o
+
+    def snapshot_delta_state(self):
+        """Clone the delta layers' recurrent/conv states + position. Cheap
+        (~1MB/layer) unlike KV. Returns None for non-delta models — callers
+        can hook unconditionally."""
+        if not getattr(self.params, 'gdn_enabled', False) or self._fla_cache is None:
+            return None
+        states = getattr(self._fla_cache, 'states', None)
+        if states is None:
+            raise RuntimeError(
+                "FLA Cache has no .states — fla version changed its schema; "
+                "update snapshot_delta_state before using spec decode on delta trunks.")
+        return (self._clone_state_tree(list(states)), self._fla_cache_pos)
+
+    def restore_delta_state(self, snap):
+        """Restore a snapshot_delta_state() result. Re-clones, so one snap can
+        restore multiple times. Resets the state position so the seek-guard
+        accepts continuation from the snapshot point."""
+        if snap is None:
+            return
+        states, pos = snap
+        self._fla_cache.states[:] = self._clone_state_tree(states)
+        self._fla_cache_pos = pos
 
         # The cache no longer exists → its token ledger is meaningless.
         self.reset_cache_ledger()
@@ -2317,6 +2794,7 @@ class Transformer(nn.Module):
         start_pos: Optional[int] = None,
         active_layers: Optional[int] = None,
         scaffold_mode: bool = False,
+        cce_valids: Optional[dict] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Unified forward - handles training, eval, and KV-cached inference.
@@ -2379,6 +2857,14 @@ class Transformer(nn.Module):
         # ~98k tok/doc -> ~2% of windows carry a BOS).
         if self.params.doc_attn_mask and _has_bos:
             block_mask = self._build_doc_block_mask(tokens)
+        # Delta-rule (KDA/GDN) layers get the SAME doc confinement via FLA
+        # varlen state resets (docs/KDA_VARLEN_DOC_RESET.md). No-BOS batches
+        # skip it: per-row state in [B, S] mode is exactly the row-boundary
+        # flattened form, so the fast path is bit-equivalent, mirroring the
+        # flex no-BOS dispatch above.
+        doc_cu = None
+        if self.params.doc_attn_mask and getattr(self.params, 'gdn_enabled', False) and _has_bos:
+            doc_cu = doc_cu_seqlens(tokens, self.params.bos_token_id)
         if self.params.doc_pos_reset and _has_bos:
             pos = doc_position_ids(tokens, self.params.bos_token_id)  # [B, S]
             # gather ONCE and pre-cast to the activation dtype: the FSDP mp_policy would
@@ -2426,7 +2912,7 @@ class Transformer(nn.Module):
                 # Selective retrieval from completed blocks + partial sum
                 h = block_attn_res(blocks, partial_block, self.attn_res_queries[i],
                                    self.attn_res_key_norms[i].weight, self.attn_res_key_norms[i].eps)
-                h_out = blk(h, freqs_cos, freqs_sin, block_mask)
+                h_out = blk(h, freqs_cos, freqs_sin, block_mask, doc_cu)
                 # Accumulate layer delta (sublayer output) into partial block
                 partial_block = partial_block + (h_out - h)
                 # Block boundary: store completed block, reset accumulator
@@ -2442,19 +2928,19 @@ class Transformer(nn.Module):
             for i, blk in enumerate(self.layers):
                 if i >= n_active:
                     break
-                h = blk(h, freqs_cos, freqs_sin, block_mask)
+                h = blk(h, freqs_cos, freqs_sin, block_mask, doc_cu)
                 if capture_aux and i in self._aux_head_layer_set:
                     aux_taps[i] = h
         elif capture_aux:
             # Full-depth path with aux heads enabled: enumerate to capture taps.
             for i, blk in enumerate(self.layers):
-                h = blk(h, freqs_cos, freqs_sin, block_mask)
+                h = blk(h, freqs_cos, freqs_sin, block_mask, doc_cu)
                 if i in self._aux_head_layer_set:
                     aux_taps[i] = h
         else:
             # Full-depth path — identical to original for torch.compile fast path
             for blk in self.layers:
-                h = blk(h, freqs_cos, freqs_sin, block_mask)
+                h = blk(h, freqs_cos, freqs_sin, block_mask, doc_cu)
 
         # In scaffold_mode the main LM head is intentionally skipped — the
         # partial network's "LM head" is the deepest active aux head, and
@@ -2512,6 +2998,8 @@ class Transformer(nn.Module):
                     h_flat,
                     self.output.weight,
                     tgt_flat,
+                    valids=(cce_valids.get('main', _CCE_VALIDS_ABSENT)
+                            if cce_valids is not None else _CCE_VALIDS_ABSENT),
                     accum_e_fp32=accum_fp32,
                     accum_c_fp32=accum_fp32,
                     reduction="mean",
@@ -2577,6 +3065,8 @@ class Transformer(nn.Module):
                         hm_flat,
                         self.output.weight,
                         mtp_tgt.reshape(-1),
+                        valids=(cce_valids.get('mtp', _CCE_VALIDS_ABSENT)
+                                if cce_valids is not None else _CCE_VALIDS_ABSENT),
                         accum_e_fp32=accum_fp32,
                         accum_c_fp32=accum_fp32,
                         reduction="mean",
@@ -2683,15 +3173,36 @@ class Transformer(nn.Module):
             logits: [B, S, vocab_size]
         """
         assert self.has_caches(), "Must call setup_caches() before generate_forward()"
-        
+
         B, S = tokens.shape
         h = self.tok_embeddings(tokens)
         # No dropout during inference
-        
+
         # Slice freqs for current position range
         freqs_cos = self.freqs_cos[start_pos:start_pos + S]
         freqs_sin = self.freqs_sin[start_pos:start_pos + S]
-        
+
+        # Delta-rule (GDN/KDA) recurrent state lifecycle. Unlike the KV cache,
+        # the recurrent state is NOT position-addressable: it summarizes the
+        # whole prefix, so it cannot be rolled back or partially reused. A
+        # prefill (start_pos == 0) starts a fresh Cache; every later call must
+        # continue EXACTLY where the state left off. Cross-turn prefix reuse
+        # (suffix prefill at start_pos > 0 after a cache reset elsewhere) is
+        # unsupported for delta-rule hybrids — re-prefill from 0 instead.
+        _fla_cache = None
+        if getattr(self.params, 'gdn_enabled', False):
+            if start_pos == 0:
+                self._fla_cache = _new_fla_cache()
+                self._fla_cache_pos = 0
+            elif self._fla_cache is None or start_pos != self._fla_cache_pos:
+                raise RuntimeError(
+                    f"generate_forward(start_pos={start_pos}) but the delta-rule "
+                    f"recurrent state is at position "
+                    f"{self._fla_cache_pos if self._fla_cache is not None else 'None'}. "
+                    f"GDN/KDA state summarizes the whole prefix and cannot seek; "
+                    f"re-prefill from start_pos=0.")
+            _fla_cache = self._fla_cache
+
         if self.attn_res_enabled:
             blocks = [h]
             partial_block = torch.zeros_like(h)
@@ -2699,7 +3210,7 @@ class Transformer(nn.Module):
             for i, blk in enumerate(self.layers):
                 h = block_attn_res(blocks, partial_block, self.attn_res_queries[i],
                                    self.attn_res_key_norms[i].weight, self.attn_res_key_norms[i].eps)
-                h_out = blk.forward_with_cache(h, freqs_cos, freqs_sin, start_pos)
+                h_out = blk.forward_with_cache(h, freqs_cos, freqs_sin, start_pos, fla_cache=_fla_cache)
                 partial_block = partial_block + (h_out - h)
                 if (i + 1) % bs == 0 and (i + 1) < len(self.layers):
                     blocks.append(partial_block)
@@ -2707,7 +3218,10 @@ class Transformer(nn.Module):
                 h = h_out
         else:
             for blk in self.layers:
-                h = blk.forward_with_cache(h, freqs_cos, freqs_sin, start_pos)
+                h = blk.forward_with_cache(h, freqs_cos, freqs_sin, start_pos, fla_cache=_fla_cache)
+
+        if _fla_cache is not None:
+            self._fla_cache_pos = start_pos + S
 
         if return_h_pre:
             # speculative decoding needs the PRE-final-norm trunk state (the

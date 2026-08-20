@@ -257,6 +257,11 @@ class ShardState:
     group_idx: int
     tokens: torch.Tensor
     position: int = 0
+    # shuffle_within_shard mode: seeded permutation of window start offsets,
+    # served by index. None when shuffle is off. Rebuilt deterministically
+    # from (path, T) on resume — only perm_idx needs checkpointing.
+    perm_starts: Optional[np.ndarray] = None
+    perm_idx: int = 0
     
     @property
     def tokens_remaining(self) -> int:
@@ -319,6 +324,8 @@ class PercentageDataLoader:
         skip_shard_init: bool = False,
         data_schedule: Optional[DataMixSchedule] = None,
         resume_step: Optional[int] = None,
+        row_group_select: bool = False,
+        shuffle_within_shard: bool = False,
     ):
         """Initialize the DataLoader with one-shard-per-group caching.
 
@@ -345,6 +352,21 @@ class PercentageDataLoader:
         self.world_size = world_size
         self.split = split
         self.validation = validation
+        # Row-level group selection (2026-08-02, "shuffling sidebar"): when
+        # True, each of the B rows in a micro-batch is drawn from its OWN
+        # deficit-selected group cursor instead of the whole batch being one
+        # contiguous B*T slice of a single group. Kills within-batch same-book
+        # correlation and raises mixing granularity ~Bx; reads stay sequential
+        # per group. False = byte-identical to historical behavior. Never flip
+        # across a resume (set_state fatals on mismatch).
+        self.row_group_select = bool(row_group_select) and not validation
+        # shuffle_within_shard (2026-08-02, max-dose order intervention): serve
+        # each RAM-resident shard's windows in seeded-random order instead of
+        # sequentially — atomizes same-book clumping (the row-multiset-to-step
+        # mapping actually changes, unlike row_group_select's packaging-only
+        # placebo). Windows stay internally contiguous (doc-pack/varlen safe).
+        # Implies row-style serving. Never flip across resume.
+        self.shuffle_within_shard = bool(shuffle_within_shard) and not validation
         self.data_root = data_root
         self.window_start_tokens = 0  # Initialize this early
         self.data_schedule = data_schedule  # Optional schedule for data annealing
@@ -763,6 +785,8 @@ class PercentageDataLoader:
             tokens=tokens,
             position=0
         )
+        if self.shuffle_within_shard:
+            self._build_perm(shard_state)
         
         # Replace the group's loaded shard
         old_shard = group.loaded_shard
@@ -1106,9 +1130,12 @@ class PercentageDataLoader:
 
         if not self.active_groups:
             raise RuntimeError("No active groups to serve batches from!")
-        
+
         B, T = self.B, self.T
-        
+
+        if self.row_group_select or self.shuffle_within_shard:
+            return self._next_batch_row_select(B, T)
+
         # Ensure current group is active
         current_group = self.groups[self.current_group_idx]
         if not current_group.is_active:
@@ -1147,7 +1174,64 @@ class PercentageDataLoader:
             self._load_next_shard_for_group(self.current_group_idx)
         
         return x, y
-    
+
+    def _build_perm(self, shard_state: ShardState):
+        """Seeded permutation of window start offsets for shuffle_within_shard.
+        Seed derives from the shard path alone, so resume only needs perm_idx."""
+        import zlib
+        n_windows = (len(shard_state.tokens) - 1) // self.T
+        starts = np.arange(n_windows, dtype=np.int64) * self.T
+        seed = zlib.crc32(shard_state.path.encode("utf-8")) ^ 0x5EED
+        shard_state.perm_starts = np.random.default_rng(seed).permutation(starts)
+        shard_state.perm_idx = 0
+
+    def _next_batch_row_select(self, B: int, T: int):
+        """Row-level group selection: each row is an independent deficit-
+        selected draw of T+1 tokens from that group's sequential cursor.
+
+        Same per-cursor read pattern as the classic path (contiguous slice,
+        1-token overlap carried by advancing position by T while slicing T+1),
+        so each row remains an internally contiguous doc-packed stream — the
+        varlen/doc-mask contract is preserved. Only the GROUPING of rows into
+        micro-batches changes."""
+        xs, ys = [], []
+        for _ in range(B):
+            gi = self._select_next_group()
+            group = self.groups[gi]
+            if self.shuffle_within_shard:
+                exhausted = (not group.loaded_shard
+                             or group.loaded_shard.perm_starts is None
+                             or group.loaded_shard.perm_idx >= len(group.loaded_shard.perm_starts))
+            else:
+                exhausted = (not group.loaded_shard
+                             or group.loaded_shard.tokens_remaining < T + 1)
+            if exhausted:
+                if (not self.shuffle_within_shard and group.loaded_shard
+                        and group.loaded_shard.tokens_remaining > 0):
+                    logger.print_and_log(
+                        f"{rank_prefix(self.rank)} Abandoning "
+                        f"{group.loaded_shard.tokens_remaining} tokens from "
+                        f"{group.name} shard (too few for row)", r0_only=False)
+                self._load_next_shard_for_group(gi)
+            shard = group.loaded_shard
+            if self.shuffle_within_shard:
+                start = int(shard.perm_starts[shard.perm_idx])
+                shard.perm_idx += 1
+            else:
+                start = shard.position
+                shard.position += T
+            row = shard.tokens[start:start + T + 1]
+            xs.append(row[:-1])
+            ys.append(row[1:])
+            group.historical_tokens_served += T
+            group.window_tokens_served += T
+            self.current_group_idx = gi
+        # shard.tokens is a torch.Tensor; stack slices directly so dtype and
+        # device match the classic path exactly.
+        x = torch.stack(xs)
+        y = torch.stack(ys)
+        return x, y
+
     def _schedule_fingerprint(self) -> str:
         """Return a stable hash of the current data schedule.
 
@@ -1180,11 +1264,14 @@ class PercentageDataLoader:
             if group.loaded_shard:
                 shard_states[group.name] = {
                     'path': group.loaded_shard.path,
-                    'position': group.loaded_shard.position
+                    'position': group.loaded_shard.position,
+                    'perm_idx': group.loaded_shard.perm_idx,
                 }
 
         return {
             'version': '5.1',
+            'row_group_select': self.row_group_select,
+            'shuffle_within_shard': self.shuffle_within_shard,
             'window_start_tokens': self.window_start_tokens,
             'current_group_idx': self.current_group_idx,
             'schedule_fingerprint': self._schedule_fingerprint(),
@@ -1202,6 +1289,22 @@ class PercentageDataLoader:
     
     def set_state(self, state: Dict):
         """Restore state from checkpoint, handling new/removed groups gracefully."""
+        # row_group_select changes the consumption pattern (row-level vs
+        # slice-level draws) — flipping it across a resume silently changes
+        # data semantics mid-run. Old checkpoints (no key) are all slice-level.
+        saved_rgs = bool(state.get('row_group_select', False))
+        if saved_rgs != self.row_group_select:
+            raise RuntimeError(
+                f"row_group_select mismatch across resume: checkpoint={saved_rgs} "
+                f"live-config={self.row_group_select}. This flag changes data "
+                f"consumption semantics and must not flip mid-run.")
+        saved_sws = bool(state.get('shuffle_within_shard', False))
+        if saved_sws != self.shuffle_within_shard:
+            raise RuntimeError(
+                f"shuffle_within_shard mismatch across resume: checkpoint={saved_sws} "
+                f"live-config={self.shuffle_within_shard}. This flag changes data "
+                f"order semantics and must not flip mid-run.")
+
         # Restore window tracking
         self.window_start_tokens = state.get('window_start_tokens', 0)
         
@@ -1261,6 +1364,11 @@ class PercentageDataLoader:
                             tokens=tokens,
                             position=ss['position']
                         )
+                        if self.shuffle_within_shard:
+                            # perm is deterministic from (path, T); only the
+                            # serving index needs restoring.
+                            self._build_perm(group.loaded_shard)
+                            group.loaded_shard.perm_idx = int(ss.get('perm_idx', 0))
                         logger.print_and_log(f"{rank_prefix(self.rank)} Restored {group.name} shard: {os.path.basename(shard_path)} @ position {ss['position']}",r0_only=False)
                         restored_shard_names.add(group.name)
                     except Exception as e:

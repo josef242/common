@@ -217,18 +217,30 @@ class LayerDiagnostics:
         """Get all parameters for the attention block of a layer."""
         if getattr(layer, 'use_gdn', False):
             gdn = layer.gdn_attn
-            params = [gdn.q_proj.weight, gdn.k_proj.weight, gdn.v_proj.weight, gdn.o_proj.weight]
-            if hasattr(gdn, 'g_proj') and gdn.g_proj is not None:
-                params.append(gdn.g_proj.weight)
-            # GDN-specific recurrent state params (delta rule dynamics)
-            for attr in ('a_proj', 'b_proj'):
-                if hasattr(gdn, attr):
-                    params.append(getattr(gdn, attr).weight)
+
+            def _wts(m):
+                # KDA (gdn_impl='kda') parameterizes some projections as
+                # low-rank Sequentials (g_proj = Linear->Linear; f_proj
+                # likewise); GDN uses plain Linears. Yield every leaf weight
+                # either way — `.weight` on a Sequential is the AttributeError
+                # that killed the kda-nope arm at its first telemetry cadence
+                # (2026-07-30, step 50).
+                if m is None:
+                    return []
+                if hasattr(m, 'weight') and m.weight is not None:
+                    return [m.weight]
+                return [c.weight for c in m.modules()
+                        if hasattr(c, 'weight') and c.weight is not None]
+
+            params = [*_wts(gdn.q_proj), *_wts(gdn.k_proj),
+                      *_wts(gdn.v_proj), *_wts(gdn.o_proj)]
+            params += _wts(getattr(gdn, 'g_proj', None))
+            # Delta-rule dynamics: GDN carries a_proj/b_proj; KDA f_proj/b_proj
+            for attr in ('a_proj', 'b_proj', 'f_proj'):
+                params += _wts(getattr(gdn, attr, None))
             for attr in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                if hasattr(gdn, attr):
-                    params.append(getattr(gdn, attr).weight)
-            if hasattr(gdn, 'o_norm') and gdn.o_norm is not None:
-                params.append(gdn.o_norm.weight)
+                params += _wts(getattr(gdn, attr, None))
+            params += _wts(getattr(gdn, 'o_norm', None))
             return params
 
         attn = layer.attention

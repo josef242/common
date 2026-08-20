@@ -301,7 +301,8 @@ class Fsdp1dWork:
     muon handle for fsdp2 1d mesh.
     """
 
-    def __init__(self, param, state, group, index: int, wd_overrides: dict, lr_scale_overrides: dict):
+    def __init__(self, param, state, group, index: int, wd_overrides: dict, lr_scale_overrides: dict,
+                 allow_uneven: bool = False):
         self.param = param
         self.state = state
         self.group = group
@@ -317,14 +318,17 @@ class Fsdp1dWork:
         # (torch.chunk semantics -> unequal shards) size-mismatches the NCCL gather and
         # HANGS silently at the first optimizer step (verified empirically). Turn that
         # into an immediate, explainable launch-time error.
+        # allow_uneven=True is passed ONLY by _Fsdp1dBatchedPipeline, whose padded
+        # transport handles uneven locals; this work's own start()/finish() path
+        # still cannot (and the pipeline never calls them).
         if isinstance(param, DTensor) and param.device_mesh.ndim == 1:
             _ws = param.device_mesh.size()
-            if param.shape[0] % _ws != 0:
+            if param.shape[0] % _ws != 0 and not allow_uneven:
                 raise ValueError(
                     f"Muon FSDP2 gather requires dim-0 divisible by world_size: param shape "
                     f"{tuple(param.shape)} over {_ws} ranks gives uneven Shard(0) locals, which "
                     f"deadlocks the gather in Fsdp1dWork.start (silent NCCL hang). Adjust the "
-                    f"model dims or the GPU count.")
+                    f"model dims or the GPU count, or enable muon_comm_batch (padded transport).")
             # The gather/cat(dim=0)/chunk/scatter round-trip below is ONLY the
             # identity for Shard(0). A Replicate or Shard(1) DTensor passes the
             # divisibility check above, then NS runs on a wrongly-stacked matrix
@@ -446,6 +450,17 @@ class Fsdp1dWork:
         else:
             scatter(grad.to_local(), None, group_src=dest_rank, group=pg, async_op=False)
 
+        self._apply_local_update(R, use_muonsphere)
+
+    def _apply_local_update(self, R=1.0, use_muonsphere=False):
+        """Everything AFTER the NS'd update has landed in grad's local storage:
+        rms scaling -> NorMuon -> tangent projection -> WD -> apply. Extracted
+        verbatim from finish() so the batched transport path (muon_comm_batch)
+        can reuse the exact same math on the exact same storage — any change
+        here changes BOTH paths, keeping them bit-identical by construction."""
+        grad = self.param.grad
+        pg = grad.device_mesh.get_group()
+
         update = apply_scaling(grad, self.group["rms_scale"])
 
         # Apply NorMuon neuron-wise normalization if enabled
@@ -469,7 +484,38 @@ class Fsdp1dWork:
             _wf = _w_loc.reshape(-1).float()
             _stats = torch.stack([(_uf * _wf).sum(), (_wf * _wf).sum()])  # [<U,W>_local, ‖W‖²_local]
             all_reduce(_stats, group=pg)                                  # global sums over shards
-            _dot, _wsq = _stats[0].item(), _stats[1].item()
+            if self.group.get("tangent_project_sync_free", False):
+                # Sync-free path (PERF_CAMPAIGN F2, 2026-08-13): the two .item()s
+                # below each cost a full pipeline drain per body matrix (trace-
+                # attributed ~12s/step fleet-wide). Here the projection coefficient
+                # stays a 0-dim GPU tensor and radial_stats holds the RAW global
+                # [⟨U,W⟩, ‖W‖²] vector; the train-loop consumer derives (‖W‖, γ)
+                # after ONE batched .cpu() over all matrices, and drops wsq<=0
+                # entries there (matching the _wsq>0 guard of the legacy path;
+                # W≡0 also forces ⟨U,W⟩=0, so _c_t is 0 and the update is a no-op).
+                _rs = getattr(self, "radial_stats", None)
+                if _rs is not None:
+                    _rs[id(self.param)] = _stats
+                _strength = self.group.get("tangent_project_strength", 1.0)
+                _c_t = (_stats[0] / _stats[1].clamp_min(1e-30)) * _strength
+                # Audit hardening (2026-08-19): if _stats ever carries an inf
+                # (upstream numeric event), inf*strength(0.0) -> NaN, and a NaN
+                # coefficient poisons the weights PERSISTENTLY. Zero is the
+                # correct degraded value: "no projection this step".
+                _c_t = torch.nan_to_num(_c_t, nan=0.0, posinf=0.0, neginf=0.0)
+                if self.group.get("tangent_project_preserve_norm", False):
+                    _un0 = torch.stack([(_uf * _uf).sum()])
+                    all_reduce(_un0, group=pg)
+                    _u_loc.sub_(_w_loc.to(_u_loc.dtype).mul(_c_t))
+                    _un1 = torch.stack([(_u_loc.reshape(-1).float() ** 2).sum()])
+                    all_reduce(_un1, group=pg)
+                    _u_loc.mul_(_un0[0].clamp_min(0).sqrt()
+                                / _un1[0].clamp_min(0).sqrt().clamp_min(1e-30))
+                else:
+                    _u_loc.sub_(_w_loc.to(_u_loc.dtype).mul(_c_t))
+                _dot = _wsq = 0.0  # skip the legacy block below — its work is done
+            else:
+                _dot, _wsq = _stats[0].item(), _stats[1].item()
             if _wsq > 0:
                 # Shadow-norm body controller telemetry: ‖W‖ and the measured free radial-growth
                 # rate γ = −⟨U,W⟩/‖W‖² (RAW, may be <0 = inward radial; the controller clamps/
@@ -531,6 +577,303 @@ class Fsdp1dWork:
                     self.param.mul_(1 - effective_lr * wd)
 
             self.param.add_(update.reshape(self.param.shape), alpha=-effective_lr)
+
+
+class _Fsdp1dBatchedPipeline:
+    """Wave-batched transport for the Fsdp1dWork gather->NS->scatter round-trip
+    (muon_comm_batch: true). The MATH per matrix is unchanged — same momentum
+    call, NS on a byte-identical full-precision buffer, the update landing in
+    the same grad-local storage, then the shared Fsdp1dWork._apply_local_update.
+    What changes is transport only: instead of one NCCL gather + one scatter
+    PER MATRIX (2 x ~600 latency-bound SendRecv rounds of ~3MB shards per step
+    — measured 12s/step on rig-30's PCIe ring, 2026-08-04 trace), shards are
+    coalesced into ONE gather and ONE scatter per destination rank per wave.
+
+    Uneven Shard(0) locals (world sizes that do not divide dim-0, e.g. the
+    (128, embd) KDA head matrix over 6 ranks) are handled by padding each
+    matrix's per-rank segment to its max local row count; pad rows travel and
+    are sliced off at both ends. This removes the divisibility fatal that
+    restricted KDA models to world sizes 8/4/2 (ledger 2026-08-05).
+
+    Not supported: use_muonsphere (per-matrix weight gathers + broadcasts are
+    interleaved with transport in ways this pipeline does not reproduce —
+    refused loudly below, fall back to muon_comm_batch: false).
+    """
+
+    def __init__(self, wave_mb: int = 256):
+        self.wave_bytes = int(wave_mb) * 1024 * 1024
+
+    @staticmethod
+    def _chunk_sizes(dim0: int, world: int) -> list[int]:
+        # torch.chunk semantics (what DTensor Shard(0) uses): ceil-sized chunks,
+        # trailing ranks may be short or empty.
+        c = -(-dim0 // world)
+        return [max(0, min(c, dim0 - r * c)) for r in range(world)]
+
+    def run(self, works: list["Fsdp1dWork"]):
+        if not works:
+            return
+        if works[0].group.get("use_muonsphere", False):
+            raise RuntimeError(
+                "muon_comm_batch does not support use_muonsphere — set "
+                "muon_comm_batch: false for MuonSphere runs.")
+
+        grad0 = works[0].param.grad
+        pg = grad0.device_mesh.get_group()
+        world = grad0.device_mesh.size()
+        rank = get_rank(pg)
+
+        # Momentum for every matrix first (identical to Fsdp1dWork.start()).
+        for w in works:
+            w.param.grad = apply_momentum(
+                w.param.grad, w.state["momentum_buffer"],
+                w.group["momentum"], w.group["nesterov"])
+
+        # Waves capped by total send-buffer bytes. REVIEW CORRECTION
+        # (2026-08-16 critic pass): simultaneous residency is up to ~4x wave
+        # bytes per rank (send + recv + glists-on-dest + scatter-out), not the
+        # ~2x this comment originally claimed — at wave_mb=2048 that is ~6-7GB
+        # transient during the optimizer phase. Empirically survived 16
+        # optimizer steps at the T=4096/B=5 production shape (N1, peak-sampled
+        # 22.2GB), but the margin is unmeasured; bracket optimizer.step() with
+        # max_memory_allocated before shrinking headroom further.
+        waves, wave, wave_bytes = [], [], 0
+        for w in works:
+            p = w.param
+            max_rows = -(-p.shape[0] // world)
+            seg_bytes = max_rows * p.shape[1] * p.grad.to_local().element_size()
+            if wave and wave_bytes + seg_bytes > self.wave_bytes:
+                waves.append(wave)
+                wave, wave_bytes = [], 0
+            wave.append(w)
+            wave_bytes += seg_bytes
+        if wave:
+            waves.append(wave)
+
+        # F10 (PERF_CAMPAIGN): wave pipelining. Legacy (flag 0/absent) runs
+        # each wave to completion — including BLOCKING scatters — before the
+        # next packs; the P2-2 trace zoom measured the result: 7.81s/step
+        # optimizer phase with ZERO comm/NS overlap. The pipelined schedule
+        # keeps the per-wave math and the per-rank collective ORDER identical
+        # (pack k -> ns k-1 -> land k-2 is a pure function of the wave plan,
+        # derived identically on every rank) while letting wave k+1's gathers
+        # ride under wave k's NS and deferring scatter waits one slot.
+        if works[0].group.get("muon_comm_pipeline", 0) and len(waves) > 1:
+            ctxs: list = [None] * len(waves)
+            for k, wv in enumerate(waves):
+                ctxs[k] = self._pack(wv, pg, rank, world)
+                if k >= 1:
+                    self._ns(ctxs[k - 1], pg, rank, world)
+                if k >= 2:
+                    self._land(ctxs[k - 2], rank, world)
+                    ctxs[k - 2] = None  # free buffers
+            self._ns(ctxs[-1], pg, rank, world)
+            if len(waves) >= 2:
+                self._land(ctxs[-2], rank, world)
+            self._land(ctxs[-1], rank, world)
+        else:
+            for wv in waves:
+                self._flush(wv, pg, rank, world)
+
+    # ── F10 pipelined stages ──────────────────────────────────────────────
+    # _pack/_ns/_land are _flush's exact code split at its stage seams; the
+    # ONLY behavioral deltas vs _flush are (a) scatters go async_op=True with
+    # handles waited in _land, (b) stages of different waves interleave per
+    # run()'s schedule. Per-matrix math is untouched and byte-identical.
+
+    def _pack(self, wave, pg, rank, world):
+        if not wave:
+            return None
+        buckets: dict[int, list] = {}
+        for w in wave:
+            p = w.param
+            dim0, cols = p.shape[0], p.numel() // p.shape[0]
+            sizes = self._chunk_sizes(dim0, world)
+            max_rows = sizes[0] if sizes else 0
+            loc = p.grad.to_local()
+            assert loc.shape[0] == sizes[rank], (
+                f"Shard(0) local rows {loc.shape[0]} != derived {sizes[rank]} "
+                f"for {tuple(p.shape)} over {world} ranks — split-semantics drift")
+            d = w.index % world
+            buckets.setdefault(d, []).append((w, dim0, cols, sizes, max_rows))
+
+        dests = sorted(buckets)
+        send, recv, handles, glists = {}, {}, {}, {}
+        for d in dests:
+            numel = sum(mr * c for (_, _, c, _, mr) in buckets[d])
+            g0 = buckets[d][0][0].param.grad
+            buf = torch.empty(numel, dtype=g0.to_local().dtype, device=g0.to_local().device)
+            off = 0
+            for (w, dim0, cols, sizes, max_rows) in buckets[d]:
+                loc = w.param.grad.to_local().reshape(sizes[rank], cols)
+                assert loc.dtype == buf.dtype, (
+                    f"mixed grad dtypes in one muon bucket ({loc.dtype} vs {buf.dtype}) "
+                    f"— copy_ would silently cast and break unbatched parity")
+                seg = buf[off:off + max_rows * cols].view(max_rows, cols)
+                seg[:sizes[rank]].copy_(loc)
+                if sizes[rank] < max_rows:
+                    seg[sizes[rank]:].zero_()
+                off += max_rows * cols
+            send[d] = buf
+            recv[d] = torch.empty_like(buf)
+            if rank == d:
+                glists[d] = [torch.empty_like(buf) for _ in range(world)]
+                handles[d] = gather(buf, glists[d], group_dst=d, group=pg, async_op=True)
+            else:
+                glists[d] = None
+                handles[d] = gather(buf, None, group_dst=d, group=pg, async_op=True)
+        return {"wave": wave, "buckets": buckets, "dests": dests, "send": send,
+                "recv": recv, "handles": handles, "glists": glists}
+
+    def _ns(self, ctx, pg, rank, world):
+        if ctx is None:
+            return
+        buckets, dests = ctx["buckets"], ctx["dests"]
+        send, recv, handles, glists = ctx["send"], ctx["recv"], ctx["handles"], ctx["glists"]
+        scat = {}
+        for d in dests:
+            handles[d].wait()
+            if rank != d:
+                continue
+            lists = glists[d]
+            out = [torch.empty_like(send[d]) for _ in range(world)]
+            off = 0
+            for (w, dim0, cols, sizes, max_rows) in buckets[d]:
+                full = torch.empty(dim0, cols, dtype=send[d].dtype, device=send[d].device)
+                ro = 0
+                for r in range(world):
+                    if sizes[r] == 0:
+                        continue
+                    seg = lists[r][off:off + max_rows * cols].view(max_rows, cols)
+                    full[ro:ro + sizes[r]].copy_(seg[:sizes[r]])
+                    ro += sizes[r]
+                full.copy_(zeropower_via_newtonschulz5(full, w.group["ns_steps"]))
+                full = full.type_as(w.param.grad)
+                ro = 0
+                for r in range(world):
+                    seg = out[r][off:off + max_rows * cols].view(max_rows, cols)
+                    seg[:sizes[r]].copy_(full[ro:ro + sizes[r]])
+                    if sizes[r] < max_rows:
+                        seg[sizes[r]:].zero_()
+                    ro += sizes[r]
+                off += max_rows * cols
+            scat[d] = out
+        # Review hardening (2026-08-16): hold scatter-source buffers in ctx
+        # explicitly until _land, rather than relying on c10d recordStream
+        # caching-allocator protection for function-local lifetimes.
+        ctx["scat"] = scat
+        ctx["scat_handles"] = {
+            d: scatter(ctx["recv"][d], scatter_list=scat.get(d), group_src=d,
+                       group=pg, async_op=True)
+            for d in dests
+        }
+
+    def _land(self, ctx, rank, world):
+        if ctx is None:
+            return
+        for d in ctx["dests"]:
+            ctx["scat_handles"][d].wait()
+        for d in ctx["dests"]:
+            off = 0
+            for (w, dim0, cols, sizes, max_rows) in ctx["buckets"][d]:
+                seg = ctx["recv"][d][off:off + max_rows * cols].view(max_rows, cols)
+                w.param.grad.to_local().reshape(sizes[rank], cols).copy_(seg[:sizes[rank]])
+                off += max_rows * cols
+        for w in ctx["wave"]:
+            w._apply_local_update()
+
+    def _flush(self, wave, pg, rank, world):
+        if not wave:
+            return
+        # Bucket by destination rank; every rank derives the SAME buckets and
+        # offsets (dest = index % world, wave order), so the collective
+        # sequence below (gathers then scatters, ascending dest) is identical
+        # across ranks — the ordering contract NCCL requires.
+        buckets: dict[int, list] = {}
+        for w in wave:
+            p = w.param
+            dim0, cols = p.shape[0], p.numel() // p.shape[0]
+            sizes = self._chunk_sizes(dim0, world)
+            max_rows = sizes[0] if sizes else 0
+            loc = p.grad.to_local()
+            # 2D view contract: Fsdp1dWork feeds NS a (dim0, cols) matrix.
+            assert loc.shape[0] == sizes[rank], (
+                f"Shard(0) local rows {loc.shape[0]} != derived {sizes[rank]} "
+                f"for {tuple(p.shape)} over {world} ranks — split-semantics drift")
+            d = w.index % world
+            buckets.setdefault(d, []).append((w, dim0, cols, sizes, max_rows))
+
+        dests = sorted(buckets)
+        send, recv, handles, glists = {}, {}, {}, {}
+        for d in dests:
+            numel = sum(mr * c for (_, _, c, _, mr) in buckets[d])
+            g0 = buckets[d][0][0].param.grad
+            buf = torch.empty(numel, dtype=g0.to_local().dtype, device=g0.to_local().device)
+            off = 0
+            for (w, dim0, cols, sizes, max_rows) in buckets[d]:
+                loc = w.param.grad.to_local().reshape(sizes[rank], cols)
+                assert loc.dtype == buf.dtype, (
+                    f"mixed grad dtypes in one muon bucket ({loc.dtype} vs {buf.dtype}) "
+                    f"— copy_ would silently cast and break unbatched parity")
+                seg = buf[off:off + max_rows * cols].view(max_rows, cols)
+                seg[:sizes[rank]].copy_(loc)
+                if sizes[rank] < max_rows:
+                    seg[sizes[rank]:].zero_()
+                off += max_rows * cols
+            send[d] = buf
+            recv[d] = torch.empty_like(buf)
+            if rank == d:
+                glists[d] = [torch.empty_like(buf) for _ in range(world)]
+                handles[d] = gather(buf, glists[d], group_dst=d, group=pg, async_op=True)
+            else:
+                glists[d] = None
+                handles[d] = gather(buf, None, group_dst=d, group=pg, async_op=True)
+
+        # Own bucket: reconstruct each full matrix (byte-identical to the
+        # unbatched cat of exact shards), NS it, lay the update back out into
+        # per-source-rank padded segments.
+        scat = {}
+        for d in dests:
+            handles[d].wait()
+            if rank != d:
+                continue
+            lists = glists[d]
+            out = [torch.empty_like(send[d]) for _ in range(world)]
+            off = 0
+            for (w, dim0, cols, sizes, max_rows) in buckets[d]:
+                full = torch.empty(dim0, cols, dtype=send[d].dtype, device=send[d].device)
+                ro = 0
+                for r in range(world):
+                    if sizes[r] == 0:
+                        continue
+                    seg = lists[r][off:off + max_rows * cols].view(max_rows, cols)
+                    full[ro:ro + sizes[r]].copy_(seg[:sizes[r]])
+                    ro += sizes[r]
+                full.copy_(zeropower_via_newtonschulz5(full, w.group["ns_steps"]))
+                full = full.type_as(w.param.grad)
+                ro = 0
+                for r in range(world):
+                    seg = out[r][off:off + max_rows * cols].view(max_rows, cols)
+                    seg[:sizes[r]].copy_(full[ro:ro + sizes[r]])
+                    if sizes[r] < max_rows:
+                        seg[sizes[r]:].zero_()
+                    ro += sizes[r]
+                off += max_rows * cols
+            scat[d] = out
+
+        for d in dests:
+            scatter(recv[d], scatter_list=scat.get(d), group_src=d, group=pg, async_op=False)
+
+        # Land updates in grad-local storage (the same destination the
+        # unbatched scatter writes), then run the shared local math.
+        for d in dests:
+            off = 0
+            for (w, dim0, cols, sizes, max_rows) in buckets[d]:
+                seg = recv[d][off:off + max_rows * cols].view(max_rows, cols)
+                w.param.grad.to_local().reshape(sizes[rank], cols).copy_(seg[:sizes[rank]])
+                off += max_rows * cols
+        for w in wave:
+            w._apply_local_update()
 
 
 class TpFsdp2dWork:
@@ -797,6 +1140,7 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
 
             if group["use_muon"]:
+                _batch_works: list[Fsdp1dWork] = []
                 for i, p in enumerate(group["params"]):
                     # Frozen via lr_scale=0 (SCS scaffold, lr_mods, etc.):
                     # skip the entire pipeline — no all_gather, no NS, no
@@ -823,6 +1167,17 @@ class Muon(torch.optim.Optimizer):
 
                     class_work, prefetch_factor = self._get_work_class(p)
 
+                    # muon_comm_batch: divert Fsdp1d params to the wave-batched
+                    # transport (collected per group, run below). Flag off, or
+                    # any non-Fsdp1d work class -> the historical per-param
+                    # path, byte-identical to before the flag existed.
+                    if group.get("muon_comm_batch", False) and class_work is Fsdp1dWork:
+                        work = Fsdp1dWork(p, state, group, i, self.wd_overrides,
+                                          self.lr_scale_overrides, allow_uneven=True)
+                        work.radial_stats = self.radial_stats
+                        _batch_works.append(work)
+                        continue
+
                     work = class_work(p, state, group, i, self.wd_overrides, self.lr_scale_overrides)
                     work.radial_stats = self.radial_stats   # only Fsdp1dWork.finish reads it (via getattr)
                     work.start()
@@ -830,6 +1185,17 @@ class Muon(torch.optim.Optimizer):
 
                     if len(dq) > prefetch_factor:
                         dq.popleft().finish()
+
+                if _batch_works:
+                    # Drain any per-param works first so the batched pipeline's
+                    # collective sequence starts from the same point on every
+                    # rank (mixed batched/unbatched groups are unusual but legal
+                    # — e.g. a group with both Fsdp1d and single-device params).
+                    while dq:
+                        dq.popleft().finish()
+                    _Fsdp1dBatchedPipeline(
+                        wave_mb=group.get("muon_comm_batch_wave_mb", 256)
+                    ).run(_batch_works)
             else:
                 for p in group["params"]:
                     # Same freeze short-circuit for the Adam path. With
