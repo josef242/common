@@ -2849,23 +2849,28 @@ class Transformer(nn.Module):
         # reaches this code.
         block_mask = None
         _doc_on = self.params.doc_attn_mask or self.params.doc_pos_reset
-        _has_bos = bool((tokens == self.params.bos_token_id).any()) if _doc_on else False
-        # no-BOS dispatch: a micro-batch with no document boundary has doc-mask == plain
-        # causal (bit-exact, see t_no_bos_parity) and per-doc positions == arange — so take
-        # the SDPA fast path / shared tables. This sidesteps flex-causal's SM86 fwd+bwd
-        # penalty on boundary-free batches, which dominate for long-doc groups (books mean
-        # ~98k tok/doc -> ~2% of windows carry a BOS).
-        if self.params.doc_attn_mask and _has_bos:
+        _has_boundary = bool((tokens[:, 1:] == self.params.bos_token_id).any()) if _doc_on else False
+        # boundary-free dispatch: a micro-batch with no INTRA-ROW document boundary
+        # has doc-mask == plain causal (bit-exact, see t_no_bos_parity /
+        # t_leading_bos_fast_path) and per-doc positions == arange — so take the
+        # SDPA fast path / shared tables. A BOS at column 0 opens the row's only
+        # document (inclusive-cumsum doc ids: the whole row shares one id), so it
+        # creates no boundary; only a BOS at column >= 1 does. This sidesteps
+        # flex-causal's SM86 fwd+bwd penalty on boundary-free batches, which
+        # dominate for long-doc groups (books mean ~98k tok/doc -> ~2% of windows
+        # carry a boundary) AND single-document rows (eval/benchmark batches).
+        if self.params.doc_attn_mask and _has_boundary:
             block_mask = self._build_doc_block_mask(tokens)
         # Delta-rule (KDA/GDN) layers get the SAME doc confinement via FLA
-        # varlen state resets (docs/KDA_VARLEN_DOC_RESET.md). No-BOS batches
-        # skip it: per-row state in [B, S] mode is exactly the row-boundary
-        # flattened form, so the fast path is bit-equivalent, mirroring the
-        # flex no-BOS dispatch above.
+        # varlen state resets (docs/KDA_VARLEN_DOC_RESET.md). Boundary-free
+        # batches skip it: per-row state in [B, S] mode is exactly the
+        # row-boundary flattened form (a column-0 BOS coincides with the row
+        # start and is deduplicated by doc_cu_seqlens anyway), so the fast path
+        # is bit-equivalent, mirroring the flex dispatch above.
         doc_cu = None
-        if self.params.doc_attn_mask and getattr(self.params, 'gdn_enabled', False) and _has_bos:
+        if self.params.doc_attn_mask and getattr(self.params, 'gdn_enabled', False) and _has_boundary:
             doc_cu = doc_cu_seqlens(tokens, self.params.bos_token_id)
-        if self.params.doc_pos_reset and _has_bos:
+        if self.params.doc_pos_reset and _has_boundary:
             pos = doc_position_ids(tokens, self.params.bos_token_id)  # [B, S]
             # gather ONCE and pre-cast to the activation dtype: the FSDP mp_policy would
             # otherwise cast the fp32 [B,S,D/2] gather per LAYER, pinning ~n_layers bf16
@@ -2884,7 +2889,7 @@ class Transformer(nn.Module):
         # resolves per its layer kind. Flags-off runs never see the tuple.
         if self.params.swa_enabled:
             bm_local = self._build_block_mask(
-                tokens, doc=(self.params.doc_attn_mask and _has_bos),
+                tokens, doc=(self.params.doc_attn_mask and _has_boundary),
                 window=self.params.swa_window)
             block_mask = (block_mask, bm_local)
 

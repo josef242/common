@@ -62,7 +62,9 @@ class Logger:
         self._client_thr = None
         self._client_ready = threading.Event()
         self._SERVER_HOST = '127.0.0.1'        # default server host TODO: FIX THIS
-        self._SERVER_PORT = '29600'             # default server port
+        # env override so co-located processes (e.g. DP eval workers) don't race
+        # for the same rank-0 server port
+        self._SERVER_PORT = os.environ.get('NEO_LOGGER_PORT', '29600')
 
         self._writer_queue = None  # Queue for the single writer thread
         self._writer_thread = None

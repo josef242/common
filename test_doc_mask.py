@@ -174,6 +174,32 @@ def _tiny_model(**over):
     return Transformer(ModelArgs(**kw)).to(DEV).float().eval()
 
 
+def t_leading_bos_fast_path():
+    print("leading-BOS dispatch: BOS only at column 0 -> fast path, parity with flags-off model")
+    S = 256
+    m_mask = _tiny_model(doc_attn_mask=True, doc_pos_reset=True)
+    m_free = _tiny_model()  # same seed -> identical weights
+    tokens = torch.randint(6, 64, (2, S), device=DEV)
+    tokens[:, 0] = BOS  # single-document rows (eval/benchmark shape)
+    # the doc path must be SKIPPED: building the doc mask here would be a
+    # dispatch regression even if the output stayed correct
+    built = [0]
+    orig = m_mask._build_doc_block_mask
+    m_mask._build_doc_block_mask = lambda t: (built.__setitem__(0, built[0] + 1), orig(t))[1]
+    with torch.no_grad():
+        la, _ = m_mask(tokens)
+        lf, _ = m_free(tokens)
+    check("doc mask NOT built for leading-BOS batch", built[0] == 0, f"built {built[0]}x")
+    diff = (la - lf).abs().max().item()
+    check("logits identical to flags-off model", diff < 1e-4, f"diff={diff:.3e}")
+    # a mid-row BOS must still take the doc path
+    tokens[1, 100] = BOS
+    with torch.no_grad():
+        m_mask(tokens)
+    check("doc mask IS built when a row has a mid-row BOS", built[0] == 1, f"built {built[0]}x")
+    m_mask._build_doc_block_mask = orig
+
+
 def t_independence():
     print("independence (the property that IS the feature): perturbing doc 0 must not move doc 1")
     S = 256
@@ -357,7 +383,8 @@ def main():
         sys.exit(2)
     print(f"\n=== doc_attn_mask tests (torch {torch.__version__}, {torch.cuda.get_device_name(0)}) ===\n")
     for t in (t_doc_ids, t_flex_vs_reference, t_no_bos_parity, t_attention_module,
-              t_pos_reset_rope, t_independence, t_model_train_smoke, t_swa, t_mtp,
+              t_pos_reset_rope, t_leading_bos_fast_path, t_independence,
+              t_model_train_smoke, t_swa, t_mtp,
               t_meta_init_freqs, t_compile_smoke):
         t()
         print()
