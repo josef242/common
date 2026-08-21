@@ -96,8 +96,19 @@ def detect_device(preferred_gpu: Optional[int] = None) -> str:
             logger.print_and_log(f"GPU {preferred_gpu} not available, falling back to 0")
             return "cuda:0"
 
-        # auto‑pick path
-        return "cuda:1" if n > 1 else "cuda:0"
+        # auto-pick: the GPU with the most FREE memory right now. (This used to
+        # hardcode cuda:1 — assuming GPU 0 drives a display — which on mixed
+        # rigs regularly landed big models on the smallest card.)
+        if n > 1:
+            best, best_free = 0, -1
+            for i in range(n):
+                free, _total = torch.cuda.mem_get_info(i)
+                if free > best_free:
+                    best, best_free = i, free
+            logger.print_and_log(
+                f"Auto-picked GPU {best} ({best_free / 1024**3:.1f}GB free)")
+            return f"cuda:{best}"
+        return "cuda:0"
 
     if torch.backends.mps.is_available():
         return "mps"
