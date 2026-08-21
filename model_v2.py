@@ -2673,12 +2673,29 @@ class Transformer(nn.Module):
         can hook unconditionally."""
         if not getattr(self.params, 'gdn_enabled', False) or self._fla_cache is None:
             return None
-        states = getattr(self._fla_cache, 'states', None)
-        if states is None:
-            raise RuntimeError(
-                "FLA Cache has no .states — fla version changed its schema; "
-                "update snapshot_delta_state before using spec decode on delta trunks.")
-        return (self._clone_state_tree(list(states)), self._fla_cache_pos)
+        slots = self._fla_state_slots()
+        return (self._clone_state_tree([dict(s) for s in slots]), self._fla_cache_pos)
+
+    def _fla_state_slots(self):
+        """Per-layer mutable state dicts of the FLA cache, schema-agnostic.
+
+        fla <= 0.5.2 (PyPI): Cache.states is a list of per-layer dicts.
+        fla main (post-0.5.2 source installs): FLACache.layers is a list of
+        FLALayer objects, each holding the same dict as .state (keys:
+        recurrent_state, conv_state, attn_state, ffn_state, A_state).
+        Both return the LIVE dicts, so callers mutate in place.
+        """
+        cache = self._fla_cache
+        states = getattr(cache, 'states', None)
+        if states is not None:
+            return states
+        layers = getattr(cache, 'layers', None)
+        if layers is not None and all(hasattr(l, 'state') for l in layers):
+            return [l.state for l in layers]
+        raise RuntimeError(
+            "Unrecognized FLA Cache schema (no .states list, no .layers with "
+            ".state) — fla changed again; update Transformer._fla_state_slots. "
+            "Workaround: --no_spec (classic engine needs no delta snapshots).")
 
     def restore_delta_state(self, snap):
         """Restore a snapshot_delta_state() result. Re-clones, so one snap can
@@ -2687,7 +2704,18 @@ class Transformer(nn.Module):
         if snap is None:
             return
         states, pos = snap
-        self._fla_cache.states[:] = self._clone_state_tree(states)
+        slots = self._fla_state_slots()
+        restored = self._clone_state_tree(states)
+        if len(slots) != len(restored):
+            raise RuntimeError(
+                f"FLA cache layer count changed between snapshot and restore "
+                f"({len(restored)} -> {len(slots)})")
+        # Mutate each layer's dict IN PLACE: works for both fla schemas (the
+        # new FLALayer objects hold their dict by reference — replacing list
+        # entries would orphan them)
+        for slot, new in zip(slots, restored):
+            slot.clear()
+            slot.update(new)
         self._fla_cache_pos = pos
 
         # The cache no longer exists → its token ledger is meaningless.
